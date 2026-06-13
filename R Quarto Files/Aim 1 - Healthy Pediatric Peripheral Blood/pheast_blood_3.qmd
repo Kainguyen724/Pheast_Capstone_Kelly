@@ -1,0 +1,465 @@
+---
+title: "Pheast_JDM"
+format: html
+editor: visual
+---
+
+## Loading
+
+```{r}
+library(zellkonverter)
+library(SingleCellExperiment)
+
+New_sce <- readH5AD(
+  "~/0d2b3fc4-9f4b-4b29-8451-6d6c388ba015.h5ad",
+  use_hdf5 = TRUE
+)
+```
+
+```{r}
+New_sce
+assayNames(New_sce)
+colnames(colData(New_sce))
+```
+
+### **FILTERING**
+
+```{r}
+sort(unique(as.character(colData(New_sce)$development_stage)))
+sort(unique(as.character(colData(New_sce)$disease_group)))
+sort(unique(as.character(colData(New_sce)$case_control)))
+sort(unique(as.character(colData(New_sce)$disease)))
+sort(unique(as.character(colData(New_sce)$tissue)))
+sort(unique(as.character(colData(New_sce)$orig.ident)))
+
+```
+
+```{r}
+meta_new <- colData(New_sce)
+
+age_num <- suppressWarnings(
+  as.numeric(sub("-year-old stage", "", meta_new$development_stage))
+)
+
+New_ped_healthy_blood <- New_sce[
+  ,
+  !is.na(age_num) &
+  age_num < 18 &
+  meta_new$case_control == "HC" &
+  meta_new$disease_group == "HC" &
+  meta_new$disease == "normal" &
+  meta_new$tissue == "blood"
+]
+```
+
+```{r}
+cat("Total cell count after filtering:", ncol(New_ped_healthy_blood), "\n")
+cat("Total number of donors after filtering:", length(unique(colData(New_ped_healthy_blood)$donor_id)), "\n")
+cat("Ages present after filtering:\n")
+print(table(as.character(colData(New_ped_healthy_blood)$development_stage)))
+cat("Case/control labels after filtering:\n")
+print(table(as.character(colData(New_ped_healthy_blood)$case_control), useNA = "ifany"))
+cat("Disease group after filtering:\n")
+print(table(as.character(colData(New_ped_healthy_blood)$disease_group), useNA = "ifany"))
+cat("Disease labels after filtering:\n")
+print(table(as.character(colData(New_ped_healthy_blood)$disease), useNA = "ifany"))
+cat("Tissue labels after filtering:\n")
+print(table(as.character(colData(New_ped_healthy_blood)$tissue), useNA = "ifany"))
+
+```
+
+### QC:
+
+```{r}
+library(SingleCellExperiment)
+library(scuttle)
+library(Matrix)
+library(dplyr)
+library(zellkonverter)
+
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name"),
+  colnames(rowData(New_ped_healthy_blood))
+)[1]
+
+if (is.na(gene_col)) {
+  stop("No gene name column found in rowData(New_ped_healthy_blood).")
+}
+
+gene_names <- rowData(New_ped_healthy_blood)[[gene_col]]
+is_ribo <- grepl("^RPL|^RPS", gene_names, ignore.case = FALSE)
+
+assay_to_use <- assayNames(New_ped_healthy_blood)[1]
+
+New_ped_healthy_blood <- addPerCellQCMetrics(
+  New_ped_healthy_blood,
+  subsets = list(Ribo = is_ribo),
+  assay.type = assay_to_use
+)
+
+qc <- as.data.frame(colData(New_ped_healthy_blood))
+qc$cell_type <- as.character(colData(New_ped_healthy_blood)$cell_type)
+
+keep <- qc$nFeature_RNA >= 200 &
+        qc$percent.mt <= 20
+
+New_ped_healthy_blood_qc <- New_ped_healthy_blood[, keep]
+
+celltype_counts <- table(as.character(colData(New_ped_healthy_blood_qc)$cell_type))
+keep_celltypes <- names(celltype_counts[celltype_counts >= 100])
+
+New_ped_healthy_blood_qc <- New_ped_healthy_blood_qc[
+  ,
+  as.character(colData(New_ped_healthy_blood_qc)$cell_type) %in% keep_celltypes
+]
+
+qc_after <- as.data.frame(colData(New_ped_healthy_blood_qc))
+
+cat("Counts per cell mostly above 200 genes:",
+    sum(qc$nFeature_RNA >= 200), "of", nrow(qc), "cells\n")
+
+cat("Mitochondrial % acceptable (<=20%):",
+    sum(qc$percent.mt <= 20), "of", nrow(qc), "cells\n")
+
+cat("Healthy-cell profile present (low mito <=20%, low ribosomal <=30%):",
+    sum(qc$percent.mt <= 20 & qc$percent.ribo <= 30, na.rm = TRUE),
+    "of", nrow(qc), "cells\n")
+
+cat("Cells with read depth near 8,000-10,000 reads:",
+    sum(qc$nCount_RNA >= 8000 & qc$nCount_RNA <= 10000, na.rm = TRUE),
+    "of", nrow(qc), "cells\n")
+
+cat("Cells with read depth 4,000-6,000 reads:",
+    sum(qc$nCount_RNA >= 4000 & qc$nCount_RNA <= 6000, na.rm = TRUE),
+    "of", nrow(qc), "cells\n")
+
+cat("Cell count before QC:", ncol(New_ped_healthy_blood), "\n")
+cat("Cell count after QC:", ncol(New_ped_healthy_blood_qc), "\n")
+cat("Number of donors after QC:", length(unique(colData(New_ped_healthy_blood_qc)$donor_id)), "\n")
+
+cat("Cell types with at least 100 cells after QC:\n")
+print(celltype_counts[celltype_counts >= 100])
+
+```
+
+### HEATMAPS:
+
+Simplified, Vertical
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+assay_to_use <- assayNames(New_ped_healthy_blood_qc)[1]
+
+expr_mat <- assay(New_ped_healthy_blood_qc, assay_to_use)
+meta <- as.data.frame(colData(New_ped_healthy_blood_qc))
+
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name"),
+  colnames(rowData(New_ped_healthy_blood_qc))
+)[1]
+
+if (is.na(gene_col)) stop("No gene name column found.")
+
+gene_names <- rowData(New_ped_healthy_blood_qc)[[gene_col]]
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) stop("None of the requested genes were found.")
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+expr_sub <- expr_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+plot_df <- as.data.frame(t(as.matrix(expr_sub)))
+plot_df$cell_type <- meta$cell_type
+plot_df$donor_id <- meta$donor_id
+
+plot_long <- plot_df %>%
+  pivot_longer(
+    cols = all_of(genes_present),
+    names_to = "gene",
+    values_to = "expression"
+  ) %>%
+  filter(!is.na(cell_type), cell_type != "") %>%
+  mutate(
+    cell_class = case_when(
+      grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", cell_type, ignore.case = TRUE) ~ "T cell",
+      grepl("natural killer|NK", cell_type, ignore.case = TRUE) ~ "NK cell",
+      grepl("B cell|plasma|plasmablast", cell_type, ignore.case = TRUE) ~ "B / plasma",
+      grepl("monocyte|granulocyte|macrophage", cell_type, ignore.case = TRUE) ~ "Myeloid",
+      grepl("dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("erythrocyte|platelet|megakaryocyte", cell_type, ignore.case = TRUE) ~ "Erythroid / platelet",
+      grepl("precursor|progenitor", cell_type, ignore.case = TRUE) ~ "Progenitor",
+      TRUE ~ "Other"
+    )
+  )
+
+class_order <- plot_long %>%
+  filter(!is.na(donor_id), donor_id != "") %>%
+  group_by(cell_class) %>%
+  summarise(
+    n = n() / length(genes_present),
+    d = n_distinct(donor_id),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n)) %>%
+  mutate(cell_class_label = paste0(cell_class, " (d = ", d, ", n = ", n, ")"))
+
+avg_plot <- plot_long %>%
+  group_by(cell_class, gene) %>%
+  summarise(
+    mean_expression = mean(expression, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(class_order[, c("cell_class", "cell_class_label")], by = "cell_class") %>%
+  mutate(
+    cell_class_label = factor(cell_class_label, levels = class_order$cell_class_label),
+    gene = factor(gene, levels = genes_to_plot)
+  )
+
+ggplot(avg_plot, aes(x = gene, y = cell_class_label, fill = mean_expression)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.4f", mean_expression)), size = 3) +
+  scale_fill_gradient2(
+  low = "#2166AC",
+  mid = "#F7F7F7",
+  high = "#B2182B",
+  midpoint = median(avg_plot$mean_expression, na.rm = TRUE),
+  name = "Mean normalized\nexpression"
+) +
+  labs(
+    x = "Gene",
+    y = " Cell type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave(
+  "New_ped_healthy_blood_qc_heatmap_simplified_vertical.png",
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+```
+
+Vertical, non simplified
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+assay_to_use <- assayNames(New_ped_healthy_blood_qc)[1]
+
+expr_mat <- assay(New_ped_healthy_blood_qc, assay_to_use)
+meta <- as.data.frame(colData(New_ped_healthy_blood_qc))
+
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name"),
+  colnames(rowData(New_ped_healthy_blood_qc))
+)[1]
+
+if (is.na(gene_col)) stop("No gene name column found.")
+
+gene_names <- rowData(New_ped_healthy_blood_qc)[[gene_col]]
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) stop("None of the requested genes were found.")
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+expr_sub <- expr_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+plot_df <- as.data.frame(t(as.matrix(expr_sub)))
+plot_df$cell_type <- meta$cell_type
+plot_df$donor_id <- meta$donor_id
+
+plot_long <- plot_df %>%
+  pivot_longer(
+    cols = all_of(genes_present),
+    names_to = "gene",
+    values_to = "expression"
+  ) %>%
+  filter(!is.na(cell_type), cell_type != "")
+
+cell_order <- plot_long %>%
+  filter(!is.na(donor_id), donor_id != "") %>%
+  group_by(cell_type) %>%
+  summarise(
+    n = n() / length(genes_present),
+    d = n_distinct(donor_id),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n)) %>%
+  mutate(cell_type_label = paste0(cell_type, " (d = ", d, ", n = ", n, ")"))
+
+avg_plot <- plot_long %>%
+  group_by(cell_type, gene) %>%
+  summarise(
+    mean_expression = mean(expression, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(cell_order[, c("cell_type", "cell_type_label")], by = "cell_type") %>%
+  mutate(
+    cell_type_label = factor(cell_type_label, levels = cell_order$cell_type_label),
+    gene = factor(gene, levels = genes_to_plot)
+  )
+
+ggplot(avg_plot, aes(x = gene, y = cell_type_label, fill = mean_expression)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.4f", mean_expression)), size = 2.7) +
+  scale_fill_gradient2(
+  low = "#2166AC",
+  mid = "#F7F7F7",
+  high = "#B2182B",
+  midpoint = median(avg_plot$mean_expression, na.rm = TRUE),
+  name = "Mean normalized\nexpression"
+) +
+  labs(
+    x = "Gene",
+    y = " Cell type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 8)
+  )
+
+ggsave(
+  "New_ped_healthy_blood_qc_heatmap_original_vertical.png",
+  width = 9,
+  height = 14,
+  dpi = 300
+)
+```
+
+Non-simplified, horizontal
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+assay_to_use <- assayNames(New_ped_healthy_blood_qc)[1]
+
+expr_mat <- assay(New_ped_healthy_blood_qc, assay_to_use)
+meta <- as.data.frame(colData(New_ped_healthy_blood_qc))
+
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name"),
+  colnames(rowData(New_ped_healthy_blood_qc))
+)[1]
+
+if (is.na(gene_col)) stop("No gene name column found.")
+
+gene_names <- rowData(New_ped_healthy_blood_qc)[[gene_col]]
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) stop("None of the requested genes were found.")
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+expr_sub <- expr_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+plot_df <- as.data.frame(t(as.matrix(expr_sub)))
+plot_df$cell_type <- meta$cell_type
+plot_df$donor_id <- meta$donor_id
+
+plot_long <- plot_df %>%
+  pivot_longer(
+    cols = all_of(genes_present),
+    names_to = "gene",
+    values_to = "expression"
+  ) %>%
+  filter(!is.na(cell_type), cell_type != "")
+
+plot_long <- plot_long %>%
+  mutate(
+    cell_class = case_when(
+      grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", cell_type, ignore.case = TRUE) ~ "T cell",
+      grepl("natural killer|NK", cell_type, ignore.case = TRUE) ~ "NK cell",
+      grepl("B cell|plasma|plasmablast", cell_type, ignore.case = TRUE) ~ "B / plasma",
+      grepl("monocyte|granulocyte", cell_type, ignore.case = TRUE) ~ "Myeloid",
+      grepl("dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("erythrocyte|platelet", cell_type, ignore.case = TRUE) ~ "Erythroid / platelet",
+      grepl("precursor|progenitor", cell_type, ignore.case = TRUE) ~ "Progenitor",
+      TRUE ~ "Other"
+    )
+  )
+
+class_order <- plot_long %>%
+  filter(!is.na(donor_id), donor_id != "") %>%
+  group_by(cell_class) %>%
+  summarise(
+    n = n() / length(genes_present),
+    d = n_distinct(donor_id),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n)) %>%
+  mutate(cell_class_label = paste0(cell_class, " (d = ", d, ", n = ", n, ")"))
+
+avg_plot <- plot_long %>%
+  group_by(cell_class, gene) %>%
+  summarise(
+    mean_expression = mean(expression, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(class_order[, c("cell_class", "cell_class_label")], by = "cell_class") %>%
+  mutate(
+    cell_class_label = factor(cell_class_label, levels = class_order$cell_class_label),
+    gene = factor(gene, levels = genes_to_plot)
+  )
+
+ggplot(avg_plot, aes(x = gene, y = cell_class_label, fill = mean_expression)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.4f", mean_expression)), size = 3) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "#F7F7F7",
+    high = "#B2182B",
+    midpoint = median(avg_plot$mean_expression, na.rm = TRUE),
+    name = "Mean normalized\nexpression"
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  )
+
+ggsave(
+  "New_ped_healthy_blood_qc_heatmap_simplified_vertical_nolabels.png",
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+```

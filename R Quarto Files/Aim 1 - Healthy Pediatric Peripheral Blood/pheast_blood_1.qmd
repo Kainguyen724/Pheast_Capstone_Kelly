@@ -1,0 +1,3043 @@
+---
+title: "pheast_Covid"
+format: html
+editor: visual
+---
+
+## Load data & Filtering
+
+-   Used Covid dataset that had
+
+```{r}
+library(HDF5Array)
+library(rhdf5)
+library(SingleCellExperiment)
+library(zellkonverter)
+pbmc_sce <- readH5AD(
+  "15f16d33-19c9-4d77-8ba5-62c337a1f3ae/cxg_PBMCs.h5ad",
+  use_hdf5 = TRUE
+)
+```
+
+```{r}
+library(SingleCellExperiment)
+colnames(colData(pbmc_sce))
+
+grep(
+  "age|development|disease|health|status|donor|subject|child|pediatric",
+  colnames(colData(pbmc_sce)),
+  ignore.case = TRUE,
+  value = TRUE
+)
+```
+
+```{r}
+table(colData(pbmc_sce)$development_stage, useNA = "ifany")
+table(colData(pbmc_sce)$disease, useNA = "ifany")
+table(colData(pbmc_sce)$COVID_status, useNA = "ifany")
+table(colData(pbmc_sce)$Group, useNA = "ifany")
+table(colData(pbmc_sce)$tissue, useNA = "ifany")
+```
+
+```{r}
+meta <- colData(pbmc_sce)
+
+pbmc_ped_healthy <- pbmc_sce[
+  ,
+  meta$development_stage %in% c(
+    "2-5 year-old child stage",
+    "6-12 year-old child stage",
+    "adolescent stage",
+    "infant stage",
+    "newborn human stage"
+  ) &
+  meta$disease == "normal"
+]
+#pediatric healthy data filtered
+```
+
+```{r}
+meta <- colData(pbmc_sce)
+
+pbmc_ped_healthy <- pbmc_sce[
+  ,
+  meta$Group == "Paediatric" &
+  meta$disease == "normal"
+]
+```
+
+### **QC:**
+
+```{r}
+library(SingleCellExperiment)
+library(scuttle)
+library(Matrix)
+library(dplyr)
+
+# ---- Identify mitochondrial genes ----
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name"),
+  colnames(rowData(pbmc_ped_healthy))
+)[1]
+
+if (is.na(gene_col)) {
+  stop("No gene name column found in rowData(pbmc_ped_healthy).")
+}
+
+gene_names <- rowData(pbmc_ped_healthy)[[gene_col]]
+is_mito <- grepl("^MT-", gene_names)
+
+# ---- Compute QC metrics (handles 'X' vs 'counts') ----
+pbmc_ped_healthy <- addPerCellQCMetrics(
+  pbmc_ped_healthy,
+  subsets = list(Mito = is_mito),
+  assay.type = assayNames(pbmc_ped_healthy)[1]
+)
+
+qc <- as.data.frame(colData(pbmc_ped_healthy))
+
+# ---- Visualize distributions ----
+par(mfrow = c(1, 3))
+hist(qc$detected, breaks = 50, main = "Detected genes", xlab = "Detected")
+hist(qc$sum, breaks = 50, main = "Total counts", xlab = "Counts")
+hist(qc$subsets_Mito_percent, breaks = 50, main = "Mito %", xlab = "Percent")
+par(mfrow = c(1, 1))
+
+# ---- QC filter (PBMC-appropriate thresholds) ----
+keep <- qc$detected >= 200 &
+        qc$sum >= 500 &
+        qc$subsets_Mito_percent <= 20
+
+pbmc_ped_healthy_qc <- pbmc_ped_healthy[, keep]
+
+# ---- Cell-level QC table ----
+qc_df <- data.frame(
+  patient_id = qc$patient_id,
+  sample_id = qc$sample_id,
+  development_stage = qc$development_stage,
+  disease = qc$disease,
+  cell_type = qc$cell_type,
+  detected = qc$detected,
+  total_counts = qc$sum,
+  mito_percent = qc$subsets_Mito_percent,
+  keep = keep,
+  stringsAsFactors = FALSE
+)
+
+# ---- Sample-level summary ----
+sample_qc_df <- qc_df %>%
+  group_by(sample_id, patient_id, development_stage, disease) %>%
+  summarise(
+    n_cells_before_qc = n(),
+    n_cells_after_qc = sum(keep, na.rm = TRUE),
+    median_detected = median(detected, na.rm = TRUE),
+    median_counts = median(total_counts, na.rm = TRUE),
+    median_mito = median(mito_percent, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ---- Outputs ----
+dim(qc_df)
+head(qc_df)
+head(sample_qc_df)
+ncol(pbmc_ped_healthy)
+ncol(pbmc_ped_healthy_qc)
+```
+
+```{r}
+library(Matrix)
+
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+
+# Check row/column metadata and object metadata for normalization clues
+cat("Assay names:\n")
+print(assayNames(pbmc_ped_healthy_qc))
+
+cat("\nMetadata names:\n")
+print(names(metadata(pbmc_ped_healthy_qc)))
+
+cat("\nFull metadata:\n")
+print(metadata(pbmc_ped_healthy_qc))
+
+cat("\nColumn metadata names:\n")
+print(colnames(colData(pbmc_ped_healthy_qc)))
+
+cat("\nRow metadata names:\n")
+print(colnames(rowData(pbmc_ped_healthy_qc)))
+
+# Check library sizes in X
+x_sums <- Matrix::colSums(expr_mat)
+
+cat("\nSummary of column sums in X:\n")
+print(summary(x_sums))
+
+cat("\nQuantiles of column sums in X:\n")
+print(quantile(x_sums, probs = c(0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1), na.rm = TRUE))
+
+# Check nonzero value distribution
+set.seed(1)
+gene_sample <- sample(seq_len(nrow(expr_mat)), min(1000, nrow(expr_mat)))
+cell_sample <- sample(seq_len(ncol(expr_mat)), min(1000, ncol(expr_mat)))
+
+vals <- as.vector(expr_mat[gene_sample, cell_sample])
+vals_nonzero <- vals[vals > 0]
+
+cat("\nNonzero value quantiles:\n")
+print(quantile(vals_nonzero, probs = c(0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1), na.rm = TRUE))
+```
+
+### **GRAPHS:**
+
+#### Horizontal, Long Heatmap:
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+# Use X directly.
+# This dataset's X assay is already normalized/transformed as:
+# log(CPM/100 + 1), equivalent to log(counts per 10,000 + 1)
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+
+# Gene names
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name", "name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) stop("No gene name column found.")
+
+gene_names <- as.character(rowData(pbmc_ped_healthy_qc)[[gene_col]])
+
+# Metadata
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+if (!"cell_type" %in% colnames(meta)) {
+  stop("cell_type column not found in colData(pbmc_ped_healthy_qc).")
+}
+
+# donor/sample column
+donor_col <- intersect(
+  c("patient_id", "donor_id", "sample_id", "sampleID"),
+  colnames(meta)
+)[1]
+
+if (is.na(donor_col)) {
+  stop("No donor/sample ID column found in metadata.")
+}
+
+# Keep valid cells
+keep_cells <- !is.na(meta$cell_type) & meta$cell_type != "" &
+              !is.na(meta[[donor_col]]) & meta[[donor_col]] != ""
+
+meta <- meta[keep_cells, , drop = FALSE]
+expr_mat <- expr_mat[, keep_cells, drop = FALSE]
+
+# Match genes
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) stop("None of the requested genes were found.")
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+# Use already-normalized X values directly
+expr_sub <- expr_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+# ------------------------------------
+# Order detailed cell types by broad lineage
+# ------------------------------------
+cell_types <- unique(meta$cell_type)
+
+cell_type_info <- data.frame(
+  cell_type = cell_types,
+  stringsAsFactors = FALSE
+)
+
+cell_type_info$cell_group <- case_when(
+  grepl("B cell|memory B|naive B|class switched", cell_type_info$cell_type, ignore.case = TRUE) ~ "B cells",
+  grepl("plasma|plasmablast", cell_type_info$cell_type, ignore.case = TRUE) ~ "B lineage / plasma",
+  grepl("T cell|CD4|CD8|Treg|regulatory T|alpha-beta T|gamma-delta T|MAIT|mucosal invariant T", cell_type_info$cell_type, ignore.case = TRUE) ~ "T cells",
+  grepl("natural killer|\\bNK\\b|innate lymphoid|\\bILC\\b", cell_type_info$cell_type, ignore.case = TRUE) ~ "NK / ILC",
+  grepl("monocyte|dendritic|granulocyte|myeloid", cell_type_info$cell_type, ignore.case = TRUE) ~ "Myeloid",
+  grepl("hematopoietic precursor|HPC|progenitor|precursor", cell_type_info$cell_type, ignore.case = TRUE) ~ "Progenitors",
+  grepl("erythrocyte|RBC", cell_type_info$cell_type, ignore.case = TRUE) ~ "Erythroid",
+  grepl("platelet", cell_type_info$cell_type, ignore.case = TRUE) ~ "Platelets",
+  TRUE ~ "Other"
+)
+
+group_order <- c(
+  "B cells",
+  "B lineage / plasma",
+  "T cells",
+  "NK / ILC",
+  "Myeloid",
+  "Progenitors",
+  "Erythroid",
+  "Platelets",
+  "Other"
+)
+
+cell_type_info$cell_group <- factor(cell_type_info$cell_group, levels = group_order)
+
+cell_type_info <- cell_type_info %>%
+  arrange(cell_group, cell_type)
+
+cell_types_ordered <- cell_type_info$cell_type
+
+# Average expression by ordered detailed cell types
+avg_mat <- sapply(cell_types_ordered, function(ct) {
+  cols <- which(meta$cell_type == ct)
+  Matrix::rowMeans(expr_sub[, cols, drop = FALSE])
+})
+
+avg_mat <- as.matrix(avg_mat)
+rownames(avg_mat) <- genes_present
+colnames(avg_mat) <- cell_types_ordered
+
+# donor count and cell count per detailed cell type
+label_df <- meta %>%
+  group_by(cell_type) %>%
+  summarise(
+    d = n_distinct(.data[[donor_col]]),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[match(cell_types_ordered, label_df$cell_type), ]
+
+cell_type_labels <- paste0(
+  label_df$cell_type,
+  " (d = ",
+  label_df$d,
+  ", n = ",
+  label_df$n,
+  ")"
+)
+
+# Horizontal layout
+heatmap_mat <- avg_mat
+colnames(heatmap_mat) <- cell_type_labels
+
+# Remove all-NA rows/cols if needed
+heatmap_mat <- heatmap_mat[
+  rowSums(is.na(heatmap_mat)) < ncol(heatmap_mat),
+  colSums(is.na(heatmap_mat)) < nrow(heatmap_mat),
+  drop = FALSE
+]
+
+if (exists("ht")) rm(ht)
+
+# ------------------------------------
+# Quantile-based legend/color scale
+# ------------------------------------
+legend_min <- 0
+legend_max <- as.numeric(quantile(heatmap_mat, probs = 0.99, na.rm = TRUE))
+legend_mid <- legend_max / 2
+
+cat("99th percentile legend max:", legend_max, "\n")
+
+col_fun <- colorRamp2(
+  c(legend_min, legend_mid, legend_max),
+  c(
+    "#2166AC",  # blue
+    "#D0D0D0",  # gray midpoint
+    "#B2182B"   # red
+  )
+)
+
+legend_ticks <- pretty(c(legend_min, legend_max), n = 5)
+legend_ticks <- legend_ticks[legend_ticks >= legend_min & legend_ticks <= legend_max]
+
+ht <- Heatmap(
+  heatmap_mat,
+  name = "Mean expression\nlog(CPM/100 + 1)",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = NA),
+
+  # genes on y
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 10, fontface = "bold"),
+
+  # detailed cell types on x
+  column_names_side = "bottom",
+  column_names_gp = gpar(fontsize = 7),
+  column_names_rot = 90,
+
+  width = unit(26, "cm"),
+  height = unit(5.5, "cm"),
+
+  heatmap_legend_param = list(
+    title = "Mean expression\nlog(CPM/100 + 1)\n",
+    title_position = "leftcenter-rot",
+    at = legend_ticks,
+    labels = round(legend_ticks, 2),
+    legend_height = unit(45, "mm")
+  ),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- heatmap_mat[i, j]
+
+    lab <- if (val < 0.005) "0" else sprintf("%.2f", val)
+
+    grid.text(
+      lab,
+      x, y,
+      gp = gpar(fontsize = 6, col = "black")
+    )
+  }
+)
+
+grid.newpage()
+draw(ht, heatmap_legend_side = "right")
+
+png(
+  "pediatric_healthy_heatmap_horizontal_grouped_with_counts.png",
+  width = 2700,
+  height = 1700,
+  res = 220
+)
+
+grid.newpage()
+draw(ht, heatmap_legend_side = "right")
+dev.off()
+```
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+# Use X directly (already normalized/transformed)
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+# Find gene-name column
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name", "name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) {
+  stop("No usable gene name column found in rowData(pbmc_ped_healthy_qc).")
+}
+
+gene_names <- as.character(rowData(pbmc_ped_healthy_qc)[[gene_col]])
+
+# Keep requested genes that are present
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) {
+  stop("None of the requested genes were found in the dataset.")
+}
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+# Use already-normalized X values directly
+expr_sub <- expr_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+# Build plotting dataframe
+plot_df <- as.data.frame(t(as.matrix(expr_sub)))
+plot_df$cell_type <- meta$cell_type
+
+plot_long <- plot_df %>%
+  pivot_longer(
+    cols = all_of(genes_present),
+    names_to = "gene",
+    values_to = "expression"
+  ) %>%
+  filter(!is.na(cell_type), cell_type != "") %>%
+  mutate(
+    cell_class = case_when(
+      grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", cell_type, ignore.case = TRUE) ~ "T cell",
+      grepl("natural killer|NK", cell_type, ignore.case = TRUE) ~ "NK cell",
+      grepl("B cell|plasma|plasmablast", cell_type, ignore.case = TRUE) ~ "B / plasma",
+      grepl("monocyte|granulocyte", cell_type, ignore.case = TRUE) ~ "Myeloid",
+      grepl("dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("erythrocyte|platelet", cell_type, ignore.case = TRUE) ~ "Erythroid / platelet",
+      grepl("precursor|progenitor|HPC", cell_type, ignore.case = TRUE) ~ "Progenitor",
+      TRUE ~ "Other"
+    ),
+    cell_class = factor(
+      cell_class,
+      levels = c(
+        "B / plasma",
+        "Dendritic",
+        "Erythroid / platelet",
+        "Myeloid",
+        "NK cell",
+        "Progenitor",
+        "T cell",
+        "Other"
+      )
+    ),
+    gene = factor(gene, levels = genes_to_plot)
+  )
+
+p_box_2 <- ggplot(plot_long, aes(x = cell_class, y = expression)) +
+  geom_boxplot(
+    aes(color = "Boxplot"),
+    fill = "white",
+    outlier.shape = NA,
+    width = 0.55,
+    linewidth = 0.4
+  ) +
+  geom_jitter(
+    aes(color = "Cells"),
+    width = 0.18,
+    alpha = 0.08,
+    size = 0.35
+  ) +
+  scale_color_manual(
+    name = "Plot elements",
+    values = c(
+      "Boxplot" = "black",
+      "Cells" = "#ff2ca3"
+    )
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        alpha = c(1, 1),
+        size = c(1, 2)
+      )
+    )
+  ) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 2) +
+  labs(
+    title = "CD24 and SIGLEC10 expression across broad blood cell classes",
+    x = "Cell class",
+    y = "Expression (log(CPM/100 + 1))"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+p_box_2
+
+ggsave(
+  filename = "CD24_SIGLEC10_boxplot_only.png",
+  plot = p_box_2,
+  width = 10,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+# Use X directly (already normalized/transformed)
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+# Find gene-name column
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name", "name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) {
+  stop("No usable gene name column found in rowData(pbmc_ped_healthy_qc).")
+}
+
+gene_names <- as.character(rowData(pbmc_ped_healthy_qc)[[gene_col]])
+
+# Keep requested genes that are present
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) {
+  stop("None of the requested genes were found in the dataset.")
+}
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+# Use already-normalized X values directly
+expr_sub <- expr_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+# Build plotting dataframe
+plot_df <- as.data.frame(t(as.matrix(expr_sub)))
+plot_df$cell_type <- meta$cell_type
+
+plot_long <- plot_df %>%
+  pivot_longer(
+    cols = all_of(genes_present),
+    names_to = "gene",
+    values_to = "expression"
+  ) %>%
+  filter(!is.na(cell_type), cell_type != "") %>%
+  mutate(
+    cell_class = case_when(
+      grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", cell_type, ignore.case = TRUE) ~ "T cell",
+      grepl("natural killer|NK", cell_type, ignore.case = TRUE) ~ "NK cell",
+      grepl("B cell|plasma|plasmablast", cell_type, ignore.case = TRUE) ~ "B / plasma",
+      grepl("monocyte|granulocyte", cell_type, ignore.case = TRUE) ~ "Myeloid",
+      grepl("dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("erythrocyte|platelet", cell_type, ignore.case = TRUE) ~ "Erythroid / platelet",
+      grepl("precursor|progenitor|HPC", cell_type, ignore.case = TRUE) ~ "Progenitor",
+      TRUE ~ "Other"
+    ),
+    cell_class = factor(
+      cell_class,
+      levels = c(
+        "B / plasma",
+        "Dendritic",
+        "Erythroid / platelet",
+        "Myeloid",
+        "NK cell",
+        "Progenitor",
+        "T cell",
+        "Other"
+      )
+    ),
+    gene = factor(gene, levels = genes_to_plot)
+  )
+
+p_box_all <- ggplot(plot_long, aes(x = cell_class, y = expression)) +
+  geom_boxplot(
+    aes(color = "Boxplot"),
+    fill = "white",
+    outlier.shape = NA,
+    width = 0.55,
+    linewidth = 0.4
+  ) +
+  geom_jitter(
+    aes(color = "Cells"),
+    width = 0.18,
+    alpha = 0.08,
+    size = 0.35
+  ) +
+  scale_color_manual(
+    name = "Plot elements",
+    values = c(
+      "Boxplot" = "black",
+      "Cells" = "#ff2ca3"
+    )
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        alpha = c(1, 1),
+        size = c(1, 2)
+      )
+    )
+  ) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Expression of candidate genes across broad blood cell classes",
+    x = "Cell class",
+    y = "Expression (log(CPM/100 + 1))"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+p_box_all
+
+ggsave(
+  filename = "appendix_all_genes_boxplot_fixed.png",
+  plot = p_box_all,
+  width = 12,
+  height = 9,
+  dpi = 300
+)
+```
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+# Use X directly (already normalized/transformed)
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+# Find gene-name column
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name", "name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) {
+  stop("No usable gene name column found in rowData(pbmc_ped_healthy_qc).")
+}
+
+gene_names <- as.character(rowData(pbmc_ped_healthy_qc)[[gene_col]])
+
+# Keep requested genes that are present
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) {
+  stop("None of the requested genes were found in the dataset.")
+}
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+# Use already-normalized X values directly
+expr_sub <- expr_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+# Build plotting dataframe
+plot_df <- as.data.frame(t(as.matrix(expr_sub)))
+plot_df$cell_type <- meta$cell_type
+
+plot_long <- plot_df %>%
+  pivot_longer(
+    cols = all_of(genes_present),
+    names_to = "gene",
+    values_to = "expression"
+  ) %>%
+  filter(!is.na(cell_type), cell_type != "") %>%
+  mutate(
+    cell_class = case_when(
+      grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", cell_type, ignore.case = TRUE) ~ "T cell",
+      grepl("natural killer|NK", cell_type, ignore.case = TRUE) ~ "NK cell",
+      grepl("B cell|plasma|plasmablast", cell_type, ignore.case = TRUE) ~ "B / plasma",
+      grepl("monocyte|granulocyte", cell_type, ignore.case = TRUE) ~ "Myeloid",
+      grepl("dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("erythrocyte|platelet", cell_type, ignore.case = TRUE) ~ "Erythroid / platelet",
+      grepl("precursor|progenitor|HPC", cell_type, ignore.case = TRUE) ~ "Progenitor",
+      TRUE ~ "Other"
+    ),
+    cell_class = factor(
+      cell_class,
+      levels = c(
+        "B / plasma",
+        "Dendritic",
+        "Erythroid / platelet",
+        "Myeloid",
+        "NK cell",
+        "Progenitor",
+        "T cell",
+        "Other"
+      )
+    ),
+    gene = factor(gene, levels = genes_to_plot)
+  )
+
+p_violin_2 <- ggplot(plot_long, aes(x = cell_class, y = expression)) +
+  geom_violin(
+    aes(fill = "Violin"),
+    color = "black",
+    trim = TRUE,
+    scale = "width",
+    linewidth = 0.4
+  ) +
+  geom_jitter(
+    aes(color = "Cells"),
+    width = 0.18,
+    alpha = 0.08,
+    size = 0.35
+  ) +
+  scale_fill_manual(
+    name = "Plot elements",
+    values = c("Violin" = "white")
+  ) +
+  scale_color_manual(
+    name = "Plot elements",
+    values = c("Cells" = "#ff2ca3")
+  ) +
+  guides(
+    fill = guide_legend(order = 1, override.aes = list(color = "black")),
+    color = guide_legend(order = 2, override.aes = list(alpha = 1, size = 2))
+  ) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 2) +
+  labs(
+    title = "CD24 and SIGLEC10 expression across broad blood cell classes",
+    x = "Cell class",
+    y = "Expression (log(CPM/100 + 1))"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+p_violin_2
+
+ggsave(
+  filename = "CD24_SIGLEC10_violin_only.png",
+  plot = p_violin_2,
+  width = 10,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+#### Broad Cell Type Heatmap:
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+# Use X directly.
+# Based on the paper/methods context, X appears already normalized as:
+# log(CPM/100 + 1), equivalent to log(counts per 10,000 + 1)
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+
+# Gene names
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) stop("No gene name column found.")
+
+gene_names <- rowData(pbmc_ped_healthy_qc)[[gene_col]]
+
+# Metadata
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+# Keep cells with valid cell type and donor id
+keep_cells <- !is.na(meta$cell_type) & meta$cell_type != "" &
+              !is.na(meta$patient_id) & meta$patient_id != ""
+
+meta <- meta[keep_cells, , drop = FALSE]
+expr_mat <- expr_mat[, keep_cells, drop = FALSE]
+
+# Define broad cell classes
+meta <- meta %>%
+  mutate(
+    cell_class = case_when(
+      grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", cell_type, ignore.case = TRUE) ~ "T cell",
+      grepl("natural killer|NK", cell_type, ignore.case = TRUE) ~ "NK cell",
+      grepl("B cell|plasma|plasmablast", cell_type, ignore.case = TRUE) ~ "B / plasma",
+      grepl("monocyte|granulocyte", cell_type, ignore.case = TRUE) ~ "Myeloid",
+      grepl("dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("erythrocyte|platelet", cell_type, ignore.case = TRUE) ~ "Erythroid / platelet",
+      grepl("precursor", cell_type, ignore.case = TRUE) ~ "Progenitor",
+      TRUE ~ "Other"
+    )
+  )
+
+# Keep requested genes that are present
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) stop("None of the requested genes were found.")
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+# Use already-normalized X values directly
+# Do NOT do CPM normalization or log transform again
+expr_sub <- expr_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+# Average expression by broad cell class
+cell_classes <- c(
+  "B / plasma",
+  "Dendritic",
+  "Erythroid / platelet",
+  "Myeloid",
+  "NK cell",
+  "Progenitor",
+  "T cell",
+  "Other"
+)
+
+cell_classes <- cell_classes[cell_classes %in% unique(meta$cell_class)]
+
+avg_mat <- sapply(cell_classes, function(cc) {
+  cols <- which(meta$cell_class == cc)
+  Matrix::rowMeans(expr_sub[, cols, drop = FALSE])
+})
+
+avg_mat <- as.matrix(avg_mat)
+rownames(avg_mat) <- genes_present
+colnames(avg_mat) <- cell_classes
+
+# Rows = broad cell classes
+heatmap_mat <- t(avg_mat)
+
+# Donor count (d) and cell count (n) by broad class
+label_df <- meta %>%
+  group_by(cell_class) %>%
+  summarise(
+    d = n_distinct(patient_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[match(rownames(heatmap_mat), label_df$cell_class), ]
+
+rownames(heatmap_mat) <- paste0(
+  label_df$cell_class,
+  " (d = ",
+  label_df$d,
+  ", n = ",
+  label_df$n,
+  ")"
+)
+
+# Remove old heatmap if it exists
+if (exists("ht")) rm(ht)
+
+# ------------------------------------
+# Quantile-based color scale
+# Use 99th percentile to bring the max lower
+# ------------------------------------
+legend_min <- 0
+legend_max <- as.numeric(quantile(heatmap_mat, probs = 0.99, na.rm = TRUE))
+legend_mid <- legend_max / 2
+
+cat("99th percentile legend max:", legend_max, "\n")
+
+# Lighter blue, gray midpoint, red high
+col_fun <- colorRamp2(
+  c(legend_min, legend_mid, legend_max),
+  c(
+    "#2166AC",
+    "#D0D0D0",
+    "#B2182B"
+  )
+)
+
+legend_ticks <- pretty(c(legend_min, legend_max), n = 5)
+legend_ticks <- legend_ticks[legend_ticks >= legend_min & legend_ticks <= legend_max]
+
+# Heatmap
+ht <- Heatmap(
+  heatmap_mat,
+  name = "Mean expression\nlog(CPM/100 + 1)",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = NA),
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 14),
+  row_names_max_width = unit(10, "cm"),
+  show_column_names = TRUE,
+  column_names_gp = gpar(fontsize = 14, fontface = "bold"),
+  heatmap_legend_param = list(
+    title = "Mean expression\nlog(CPM/100 + 1)\n",
+    title_position = "leftcenter-rot",
+    at = legend_ticks,
+    labels = round(legend_ticks, 2),
+    legend_height = unit(55, "mm"),
+    title_gp = gpar(fontsize = 13, fontface = "bold"),
+    labels_gp = gpar(fontsize = 11)
+  ),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- heatmap_mat[i, j]
+
+    lab <- if (val < 0.005) {
+      "0"
+    } else {
+      sprintf("%.2f", val)
+    }
+
+    grid.text(
+      lab,
+      x, y,
+      gp = gpar(fontsize = 11, col = "black")
+    )
+  }
+)
+
+grid.newpage()
+draw(ht, heatmap_legend_side = "right")
+
+png(
+  "pediatric_healthy_heatmap_broad_classes_quantile99.png",
+  width = 3600,
+  height = 2400,
+  res = 300
+)
+
+grid.newpage()
+draw(ht, heatmap_legend_side = "right")
+dev.off()
+```
+
+#### Vertical, Long Heatmap:
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+# Use X directly.
+# This dataset's X assay is already normalized/transformed as:
+# log(CPM/100 + 1), equivalent to log(counts per 10,000 + 1)
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+
+# Gene names
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name", "name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) stop("No gene name column found.")
+
+gene_names <- as.character(rowData(pbmc_ped_healthy_qc)[[gene_col]])
+
+# Metadata
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+if (!"cell_type" %in% colnames(meta)) {
+  stop("cell_type column not found in colData(pbmc_ped_healthy_qc).")
+}
+
+# donor/sample column
+donor_col <- intersect(
+  c("patient_id", "donor_id", "sample_id", "sampleID"),
+  colnames(meta)
+)[1]
+
+if (is.na(donor_col)) {
+  stop("No donor/sample ID column found in metadata.")
+}
+
+# Keep valid cells
+keep_cells <- !is.na(meta$cell_type) & meta$cell_type != "" &
+              !is.na(meta[[donor_col]]) & meta[[donor_col]] != ""
+
+meta <- meta[keep_cells, , drop = FALSE]
+expr_mat <- expr_mat[, keep_cells, drop = FALSE]
+
+# Match genes
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) stop("None of the requested genes were found.")
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+# Use already-normalized X values directly
+expr_sub <- expr_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+# ------------------------------------
+# Order detailed cell types by broad lineage
+# ------------------------------------
+cell_types <- unique(meta$cell_type)
+
+cell_type_info <- data.frame(
+  cell_type = cell_types,
+  stringsAsFactors = FALSE
+)
+
+cell_type_info$cell_group <- case_when(
+  grepl("B cell|memory B|naive B|class switched", cell_type_info$cell_type, ignore.case = TRUE) ~ "B cells",
+  grepl("plasma|plasmablast", cell_type_info$cell_type, ignore.case = TRUE) ~ "B lineage / plasma",
+  grepl("T cell|CD4|CD8|Treg|regulatory T|alpha-beta T|gamma-delta T|MAIT|mucosal invariant T", cell_type_info$cell_type, ignore.case = TRUE) ~ "T cells",
+  grepl("natural killer|\\bNK\\b|innate lymphoid|\\bILC\\b", cell_type_info$cell_type, ignore.case = TRUE) ~ "NK / ILC",
+  grepl("monocyte|dendritic|granulocyte|myeloid", cell_type_info$cell_type, ignore.case = TRUE) ~ "Myeloid",
+  grepl("hematopoietic precursor|HPC|progenitor|precursor", cell_type_info$cell_type, ignore.case = TRUE) ~ "Progenitors",
+  grepl("erythrocyte|RBC", cell_type_info$cell_type, ignore.case = TRUE) ~ "Erythroid",
+  grepl("platelet", cell_type_info$cell_type, ignore.case = TRUE) ~ "Platelets",
+  TRUE ~ "Other"
+)
+
+group_order <- c(
+  "B cells",
+  "B lineage / plasma",
+  "T cells",
+  "NK / ILC",
+  "Myeloid",
+  "Progenitors",
+  "Erythroid",
+  "Platelets",
+  "Other"
+)
+
+cell_type_info$cell_group <- factor(cell_type_info$cell_group, levels = group_order)
+
+cell_type_info <- cell_type_info %>%
+  arrange(cell_group, cell_type)
+
+cell_types_ordered <- cell_type_info$cell_type
+
+# Average expression by ordered detailed cell types
+avg_mat <- sapply(cell_types_ordered, function(ct) {
+  cols <- which(meta$cell_type == ct)
+  Matrix::rowMeans(expr_sub[, cols, drop = FALSE])
+})
+
+avg_mat <- as.matrix(avg_mat)
+rownames(avg_mat) <- genes_present
+colnames(avg_mat) <- cell_types_ordered
+
+# donor count and cell count per detailed cell type
+label_df <- meta %>%
+  group_by(cell_type) %>%
+  summarise(
+    d = n_distinct(.data[[donor_col]]),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[match(cell_types_ordered, label_df$cell_type), ]
+
+cell_type_labels <- paste0(
+  label_df$cell_type,
+  " (d = ",
+  label_df$d,
+  ", n = ",
+  label_df$n,
+  ")"
+)
+
+# Vertical layout
+heatmap_mat <- t(avg_mat)
+rownames(heatmap_mat) <- cell_type_labels
+
+# Remove all-NA rows/cols if needed
+heatmap_mat <- heatmap_mat[
+  rowSums(is.na(heatmap_mat)) < ncol(heatmap_mat),
+  colSums(is.na(heatmap_mat)) < nrow(heatmap_mat),
+  drop = FALSE
+]
+
+if (exists("ht")) rm(ht)
+
+# ------------------------------------
+# Quantile-based legend/color scale
+# ------------------------------------
+legend_min <- 0
+legend_max <- as.numeric(quantile(heatmap_mat, probs = 0.99, na.rm = TRUE))
+legend_mid <- legend_max / 2
+
+cat("99th percentile legend max:", legend_max, "\n")
+
+col_fun <- colorRamp2(
+  c(legend_min, legend_mid, legend_max),
+  c(
+    "#2166AC",  # blue
+    "#D0D0D0",  # gray midpoint
+    "#B2182B"   # red
+  )
+)
+
+legend_ticks <- pretty(c(legend_min, legend_max), n = 5)
+legend_ticks <- legend_ticks[legend_ticks >= legend_min & legend_ticks <= legend_max]
+
+ht <- Heatmap(
+  heatmap_mat,
+  name = "Mean expression\nlog(CPM/100 + 1)",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = NA),
+
+  # detailed cell types on y
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 7),
+  row_names_max_width = unit(11, "cm"),
+
+  # genes on x
+  column_names_side = "bottom",
+  column_names_gp = gpar(fontsize = 10, fontface = "bold"),
+  column_names_rot = 45,
+
+  width = unit(8, "cm"),
+  height = unit(22, "cm"),
+
+  heatmap_legend_param = list(
+    title = "Mean expression\nlog(CPM/100 + 1)\n",
+    title_position = "leftcenter-rot",
+    at = legend_ticks,
+    labels = round(legend_ticks, 2),
+    legend_height = unit(45, "mm")
+  ),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- heatmap_mat[i, j]
+
+    lab <- if (val < 0.005) "0" else sprintf("%.2f", val)
+
+    grid.text(
+      lab,
+      x, y,
+      gp = gpar(fontsize = 6, col = "black")
+    )
+  }
+)
+
+grid.newpage()
+draw(ht, heatmap_legend_side = "right")
+
+png(
+  "pediatric_healthy_heatmap_vertical_grouped_with_counts.png",
+  width = 2300,
+  height = 2300,
+  res = 220
+)
+
+grid.newpage()
+draw(ht, heatmap_legend_side = "right")
+dev.off()
+```
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+
+# -----------------------------
+# Broad grouped cell-type labels
+# -----------------------------
+seu$broad_cell_type <- case_when(
+  grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", seu$cell_type, ignore.case = TRUE) ~ "T cells",
+  grepl("natural killer|NK", seu$cell_type, ignore.case = TRUE) ~ "NK cells",
+  grepl("B cell|plasma|plasmablast", seu$cell_type, ignore.case = TRUE) ~ "B / plasma cells",
+  grepl("monocyte|granulocyte", seu$cell_type, ignore.case = TRUE) ~ "Myeloid cells",
+  grepl("dendritic", seu$cell_type, ignore.case = TRUE) ~ "Dendritic cells",
+  grepl("erythrocyte|platelet", seu$cell_type, ignore.case = TRUE) ~ "Platelet / erythroid",
+  grepl("precursor", seu$cell_type, ignore.case = TRUE) ~ "Progenitors",
+  TRUE ~ "Other"
+)
+
+Idents(seu) <- seu$broad_cell_type
+
+# -----------------------------
+# CD24 UMAP with broad labels
+# -----------------------------
+p_cd24 <- FeaturePlot(
+  seu,
+  features = "CD24",
+  reduction = "umap",
+  raster = FALSE
+) +
+  ggtitle("CD24 expression") +
+  theme_classic()
+
+p_cd24 <- LabelClusters(
+  plot = p_cd24,
+  id = "ident",
+  repel = TRUE,
+  size = 5
+)
+
+# -----------------------------
+# SIGLEC10 UMAP with broad labels
+# -----------------------------
+p_siglec10 <- FeaturePlot(
+  seu,
+  features = "SIGLEC10",
+  reduction = "umap",
+  raster = FALSE
+) +
+  ggtitle("SIGLEC10 expression") +
+  theme_classic()
+
+p_siglec10 <- LabelClusters(
+  plot = p_siglec10,
+  id = "ident",
+  repel = TRUE,
+  size = 5
+)
+
+# -----------------------------
+# Show separately
+# -----------------------------
+p_cd24
+p_siglec10
+
+# -----------------------------
+# Save separately
+# -----------------------------
+ggsave("UMAP_CD24_broad_labels.png", plot = p_cd24, width = 8, height = 6, dpi = 300)
+ggsave("UMAP_SIGLEC10_broad_labels.png", plot = p_siglec10, width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+# use X as the count-like matrix
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+
+# gene names
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) stop("No gene name column found.")
+
+gene_names <- rowData(pbmc_ped_healthy_qc)[[gene_col]]
+
+# metadata
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+# keep cells with valid cell type and donor id
+keep_cells <- !is.na(meta$cell_type) & meta$cell_type != "" &
+              !is.na(meta$patient_id) & meta$patient_id != ""
+
+meta <- meta[keep_cells, , drop = FALSE]
+expr_mat <- expr_mat[, keep_cells, drop = FALSE]
+
+# define broad cell classes
+meta <- meta %>%
+  mutate(
+    cell_class = case_when(
+      grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", cell_type, ignore.case = TRUE) ~ "T cell",
+      grepl("natural killer|NK", cell_type, ignore.case = TRUE) ~ "NK cell",
+      grepl("B cell|plasma|plasmablast", cell_type, ignore.case = TRUE) ~ "B / plasma",
+      grepl("monocyte|granulocyte", cell_type, ignore.case = TRUE) ~ "Myeloid",
+      grepl("dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("erythrocyte|platelet", cell_type, ignore.case = TRUE) ~ "Erythroid / platelet",
+      grepl("precursor", cell_type, ignore.case = TRUE) ~ "Progenitor",
+      TRUE ~ "Other"
+    )
+  )
+
+# keep requested genes that are present
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) stop("Neither CD24 nor SIGLEC10 was found.")
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+# compute single-cell log2(CPM + 1)
+lib_sizes <- Matrix::colSums(expr_mat)
+cpm_mat <- t(t(expr_mat) / lib_sizes) * 1e6
+logcpm_mat <- log2(cpm_mat + 1)
+
+expr_sub <- logcpm_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+# order of broad cell classes
+cell_classes <- c(
+  "B / plasma", "Dendritic", "Erythroid / platelet",
+  "Myeloid", "NK cell", "Progenitor", "T cell", "Other"
+)
+cell_classes <- cell_classes[cell_classes %in% unique(meta$cell_class)]
+
+# average expression by broad cell class
+avg_mat <- sapply(cell_classes, function(cc) {
+  cols <- which(meta$cell_class == cc)
+  Matrix::rowMeans(expr_sub[, cols, drop = FALSE])
+})
+
+avg_mat <- as.matrix(avg_mat)
+rownames(avg_mat) <- genes_present
+colnames(avg_mat) <- cell_classes
+
+# donor count (d) and cell count (n) by broad class
+label_df <- meta %>%
+  group_by(cell_class) %>%
+  summarise(
+    d = n_distinct(patient_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[match(colnames(avg_mat), label_df$cell_class), ]
+
+colnames(avg_mat) <- paste0(
+  label_df$cell_class,
+  " (d = ",
+  label_df$d,
+  ", n = ",
+  label_df$n,
+  ")"
+)
+
+# this is already "horizontal":
+# rows = genes, columns = cell classes
+heatmap_mat <- avg_mat
+
+# color scale
+col_fun <- colorRamp2(
+  c(min(heatmap_mat, na.rm = TRUE),
+    median(heatmap_mat, na.rm = TRUE),
+    max(heatmap_mat, na.rm = TRUE)),
+  c("#2166AC", "#F7F7F7", "#B2182B")
+)
+
+# heatmap
+ht <- Heatmap(
+  heatmap_mat,
+  name = "Mean expression\n(log2(CPM + 1))",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = NA),
+
+  # genes on y-axis
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 11, fontface = "bold"),
+
+  # cell classes on x-axis
+  column_names_side = "bottom",
+  column_names_gp = gpar(fontsize = 9),
+  column_names_rot = 45,
+
+  width = unit(12, "cm"),
+  height = unit(2.8, "cm"),
+
+  heatmap_legend_param = list(
+    title = "Mean expression\n(log2(CPM + 1))",
+    title_position = "leftcenter-rot",
+    legend_height = unit(40, "mm")
+  ),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(
+      sprintf("%.3f", heatmap_mat[i, j]),
+      x, y,
+      gp = gpar(fontsize = 8, col = "black")
+    )
+  }
+)
+
+grid.newpage()
+draw(ht, heatmap_legend_side = "right")
+
+png("pediatric_healthy_heatmap_CD24_SIGLEC10_horizontal.png",
+    width = 2200, height = 900, res = 200)
+grid.newpage()
+draw(ht, heatmap_legend_side = "right")
+dev.off()
+```
+
+### **UMAP:**
+
+Updated UMAP:
+
+```{r}
+library(SingleCellExperiment)
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ggrepel)
+library(scales)
+
+set.seed(123)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+# =========================================================
+# 1. Load expression + metadata from QC-filtered object
+# =========================================================
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+if (!"cell_type" %in% colnames(meta)) {
+  stop("cell_type column not found in colData(pbmc_ped_healthy_qc).")
+}
+
+# =========================================================
+# 2. Use gene symbols as row names
+# =========================================================
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name", "name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) {
+  stop("No gene name column found in rowData(pbmc_ped_healthy_qc).")
+}
+
+gene_names <- as.character(rowData(pbmc_ped_healthy_qc)[[gene_col]])
+
+if (length(gene_names) != nrow(expr_mat)) {
+  stop("gene_names length does not match number of rows in expr_mat.")
+}
+
+rownames(expr_mat) <- make.unique(gene_names)
+
+# =========================================================
+# 3. Keep cells with valid cell type annotation
+# =========================================================
+keep_cells <- !is.na(meta$cell_type) & meta$cell_type != ""
+
+meta <- meta[keep_cells, , drop = FALSE]
+expr_mat <- expr_mat[, keep_cells, drop = FALSE]
+
+# =========================================================
+# 4. Downsample for speed
+# =========================================================
+n_umap_cells <- min(50000, ncol(expr_mat))
+
+set.seed(123)
+cells_use <- sample(seq_len(ncol(expr_mat)), n_umap_cells)
+
+expr_use <- expr_mat[, cells_use, drop = FALSE]
+meta_use <- meta[cells_use, , drop = FALSE]
+
+rownames(meta_use) <- colnames(expr_use)
+expr_use <- as(expr_use, "dgCMatrix")
+
+cat("Cells used for UMAP:", ncol(expr_use), "\n")
+
+# =========================================================
+# 5. Check genes
+# =========================================================
+genes_present <- intersect(genes_to_plot, rownames(expr_use))
+
+if (length(genes_present) == 0) {
+  stop("None of the requested genes were found in the matrix.")
+}
+
+cat("Genes found:\n")
+print(genes_present)
+
+cat("\nGenes missing:\n")
+print(setdiff(genes_to_plot, genes_present))
+
+# =========================================================
+# 6. Build Seurat object
+# IMPORTANT:
+# X already appears normalized/transformed, so do NOT
+# run NormalizeData() again.
+# =========================================================
+seu <- CreateSeuratObject(
+  counts = expr_use,
+  meta.data = meta_use,
+  project = "Pediatric_Blood"
+)
+
+DefaultAssay(seu) <- "RNA"
+
+# Put already-normalized X values into the data slot/layer
+seu <- tryCatch(
+  {
+    SetAssayData(seu, assay = "RNA", layer = "data", new.data = expr_use)
+  },
+  error = function(e) {
+    SetAssayData(seu, assay = "RNA", slot = "data", new.data = expr_use)
+  }
+)
+
+# =========================================================
+# 7. Broad grouped cell-type labels
+#    B vs Plasma split
+#    Platelets vs Erythroid split
+# =========================================================
+seu$broad_cell_type <- case_when(
+  grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", seu$cell_type, ignore.case = TRUE) ~ "T cells",
+  grepl("natural killer|NK", seu$cell_type, ignore.case = TRUE) ~ "NK cells",
+  grepl("plasma|plasmablast", seu$cell_type, ignore.case = TRUE) ~ "Plasma cells",
+  grepl("B cell", seu$cell_type, ignore.case = TRUE) ~ "B cells",
+  grepl("monocyte|granulocyte", seu$cell_type, ignore.case = TRUE) ~ "Myeloid cells",
+  grepl("dendritic", seu$cell_type, ignore.case = TRUE) ~ "Dendritic cells",
+  grepl("platelet", seu$cell_type, ignore.case = TRUE) ~ "Platelets",
+  grepl("erythrocyte|RBC", seu$cell_type, ignore.case = TRUE) ~ "Erythroid cells",
+  grepl("precursor|progenitor|HPC", seu$cell_type, ignore.case = TRUE) ~ "Progenitors",
+  TRUE ~ "Other"
+)
+
+seu$broad_cell_type <- factor(
+  seu$broad_cell_type,
+  levels = c(
+    "T cells",
+    "NK cells",
+    "B cells",
+    "Plasma cells",
+    "Myeloid cells",
+    "Dendritic cells",
+    "Platelets",
+    "Erythroid cells",
+    "Progenitors",
+    "Other"
+  )
+)
+
+# =========================================================
+# 8. Broad cell population colors
+# =========================================================
+celltype_palette <- c(
+  "T cells" = "#6A51A3",          # purple
+  "NK cells" = "#9ECAE1",         # light blue
+  "B cells" = "#31A354",          # green
+  "Plasma cells" = "#66C2A4",     # teal-green
+  "Myeloid cells" = "#E67E22",    # orange
+  "Dendritic cells" = "#A1D99B",  # pale green
+  "Platelets" = "#B39DDB",        # lilac
+  "Erythroid cells" = "#4C78A8",  # blue
+  "Progenitors" = "#F2C94C",      # yellow
+  "Other" = "#BDBDBD"             # gray
+)
+
+# =========================================================
+# 9. Slide-style workflow:
+# variable features -> PCA -> neighbors -> cluster -> UMAP
+# =========================================================
+seu <- FindVariableFeatures(
+  seu,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+seu <- ScaleData(
+  seu,
+  features = VariableFeatures(seu),
+  verbose = FALSE
+)
+
+seu <- RunPCA(
+  seu,
+  features = VariableFeatures(seu),
+  npcs = 30,
+  verbose = FALSE
+)
+
+seu <- FindNeighbors(
+  seu,
+  dims = 1:30,
+  verbose = FALSE
+)
+
+seu <- FindClusters(
+  seu,
+  resolution = 0.4,
+  verbose = FALSE
+)
+
+seu <- RunUMAP(
+  seu,
+  dims = 1:30,
+  reduction = "pca",
+  reduction.name = "umap",
+  verbose = FALSE
+)
+
+# =========================================================
+# 10. Prepare dataframe for left UMAP
+# =========================================================
+umap_df <- Embeddings(seu, "umap") %>%
+  as.data.frame()
+
+colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+umap_df$cell <- rownames(umap_df)
+umap_df$broad_cell_type <- seu$broad_cell_type[rownames(umap_df)]
+
+label_df <- umap_df %>%
+  group_by(broad_cell_type) %>%
+  summarise(
+    UMAP_1 = median(UMAP_1, na.rm = TRUE),
+    UMAP_2 = median(UMAP_2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ranges for padding and manual label placement
+x_range <- range(umap_df$UMAP_1, na.rm = TRUE)
+y_range <- range(umap_df$UMAP_2, na.rm = TRUE)
+x_span <- diff(x_range)
+y_span <- diff(y_range)
+
+label_df <- label_df %>%
+  mutate(
+    label_x = case_when(
+      broad_cell_type == "Progenitors" ~ UMAP_1 + 0.12 * x_span,
+      broad_cell_type == "Platelets" ~ UMAP_1 + 0.08 * x_span,
+      broad_cell_type == "Erythroid cells" ~ UMAP_1 + 0.09 * x_span,
+      broad_cell_type == "Plasma cells" ~ UMAP_1 - 0.02 * x_span,
+      broad_cell_type == "Dendritic cells" ~ UMAP_1 - 0.02 * x_span,
+      TRUE ~ UMAP_1
+    ),
+    label_y = case_when(
+      broad_cell_type == "Platelets" ~ UMAP_2 + 0.055 * y_span,
+      broad_cell_type == "Erythroid cells" ~ UMAP_2 - 0.045 * y_span,
+      broad_cell_type == "Dendritic cells" ~ UMAP_2 - 0.035 * y_span,
+      broad_cell_type == "Myeloid cells" ~ UMAP_2 + 0.02 * y_span,
+      broad_cell_type == "Other" ~ UMAP_2 - 0.03 * y_span,
+      TRUE ~ UMAP_2
+    )
+  )
+
+# extra plotting space so text does not get cut off
+x_limits <- c(x_range[1] - 0.04 * x_span, x_range[2] + 0.22 * x_span)
+y_limits <- c(y_range[1] - 0.06 * y_span, y_range[2] + 0.08 * y_span)
+
+# =========================================================
+# 11. Left plot: broad cell populations
+#    colored text + white label background
+# =========================================================
+p_labels <- ggplot(
+  umap_df,
+  aes(x = UMAP_1, y = UMAP_2, color = broad_cell_type)
+) +
+  geom_point(size = 0.28, alpha = 0.9, show.legend = FALSE) +
+  ggrepel::geom_label_repel(
+    data = label_df,
+    aes(
+      x = label_x,
+      y = label_y,
+      label = broad_cell_type,
+      color = broad_cell_type
+    ),
+    inherit.aes = FALSE,
+    fill = scales::alpha("white", 0.88),
+    fontface = "bold",
+    size = 4.4,
+    label.size = 0,
+    box.padding = 0.30,
+    point.padding = 0.15,
+    segment.color = NA,
+    show.legend = FALSE,
+    max.overlaps = Inf,
+    seed = 123
+  ) +
+  scale_color_manual(values = celltype_palette) +
+  coord_cartesian(
+    xlim = x_limits,
+    ylim = y_limits,
+    clip = "off"
+  ) +
+  labs(
+    title = "Cell populations",
+    x = "UMAP1",
+    y = "UMAP2"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.line = element_line(linewidth = 0.6, color = "black"),
+    plot.margin = margin(12, 32, 12, 12),
+    aspect.ratio = 1
+  )
+
+# =========================================================
+# 12. Right plots: gene expression on same UMAP
+# =========================================================
+feature_plots <- lapply(genes_present, function(g) {
+  FeaturePlot(
+    seu,
+    features = g,
+    reduction = "umap",
+    raster = FALSE,
+    order = TRUE,
+    cols = c("#fde5f3", "#ff2ca3")
+  ) +
+    scale_color_gradient(
+      low = "#fde5f3",
+      high = "#ff2ca3",
+      name = "Expression\nlog(CPM/100 + 1)"
+    ) +
+    coord_cartesian(
+      xlim = x_limits,
+      ylim = y_limits,
+      clip = "off"
+    ) +
+    labs(
+      title = g,
+      x = "UMAP1",
+      y = "UMAP2"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.title = element_text(face = "bold", size = 9),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.line = element_line(linewidth = 0.5, color = "black"),
+      legend.position = "right",
+      plot.margin = margin(8, 8, 8, 8),
+      aspect.ratio = 1
+    )
+})
+
+# =========================================================
+# 13. Combine plots
+# =========================================================
+right_panel <- wrap_plots(feature_plots, ncol = 3)
+
+final_umap_plot <- p_labels + right_panel + plot_layout(widths = c(1.18, 1.82))
+
+final_umap_plot
+
+# =========================================================
+# 14. Save
+# =========================================================
+ggsave(
+  filename = "pediatric_blood_umap_split_color_coded.png",
+  plot = final_umap_plot,
+  width = 16.5,
+  height = 9,
+  dpi = 300
+)
+```
+
+Different Type of labels:
+
+```{r}
+library(SingleCellExperiment)
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(shadowtext)
+
+set.seed(123)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+# =========================================================
+# 1. Load expression + metadata from QC-filtered object
+# =========================================================
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+if (!"cell_type" %in% colnames(meta)) {
+  stop("cell_type column not found in colData(pbmc_ped_healthy_qc).")
+}
+
+# =========================================================
+# 2. Use gene symbols as row names
+# =========================================================
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name", "name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) {
+  stop("No gene name column found in rowData(pbmc_ped_healthy_qc).")
+}
+
+gene_names <- as.character(rowData(pbmc_ped_healthy_qc)[[gene_col]])
+
+if (length(gene_names) != nrow(expr_mat)) {
+  stop("gene_names length does not match number of rows in expr_mat.")
+}
+
+rownames(expr_mat) <- make.unique(gene_names)
+
+# =========================================================
+# 3. Keep cells with valid cell type annotation
+# =========================================================
+keep_cells <- !is.na(meta$cell_type) & meta$cell_type != ""
+
+meta <- meta[keep_cells, , drop = FALSE]
+expr_mat <- expr_mat[, keep_cells, drop = FALSE]
+
+# =========================================================
+# 4. Downsample for speed
+# =========================================================
+n_umap_cells <- min(50000, ncol(expr_mat))
+
+set.seed(123)
+cells_use <- sample(seq_len(ncol(expr_mat)), n_umap_cells)
+
+expr_use <- expr_mat[, cells_use, drop = FALSE]
+meta_use <- meta[cells_use, , drop = FALSE]
+
+rownames(meta_use) <- colnames(expr_use)
+expr_use <- as(expr_use, "dgCMatrix")
+
+cat("Cells used for UMAP:", ncol(expr_use), "\n")
+
+# =========================================================
+# 5. Check genes
+# =========================================================
+genes_present <- intersect(genes_to_plot, rownames(expr_use))
+
+if (length(genes_present) == 0) {
+  stop("None of the requested genes were found in the matrix.")
+}
+
+cat("Genes found:\n")
+print(genes_present)
+
+cat("\nGenes missing:\n")
+print(setdiff(genes_to_plot, genes_present))
+
+# =========================================================
+# 6. Build Seurat object
+# IMPORTANT:
+# X already appears normalized/transformed, so do NOT
+# run NormalizeData() again.
+# =========================================================
+seu <- CreateSeuratObject(
+  counts = expr_use,
+  meta.data = meta_use,
+  project = "Pediatric_Blood"
+)
+
+DefaultAssay(seu) <- "RNA"
+
+# Put already-normalized X values into the data slot/layer
+seu <- tryCatch(
+  {
+    SetAssayData(seu, assay = "RNA", layer = "data", new.data = expr_use)
+  },
+  error = function(e) {
+    SetAssayData(seu, assay = "RNA", slot = "data", new.data = expr_use)
+  }
+)
+
+# =========================================================
+# 7. Broad grouped cell-type labels
+#    B vs Plasma split
+#    Platelets vs Erythroid split
+# =========================================================
+seu$broad_cell_type <- case_when(
+  grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", seu$cell_type, ignore.case = TRUE) ~ "T cells",
+  grepl("natural killer|NK", seu$cell_type, ignore.case = TRUE) ~ "NK cells",
+  grepl("plasma|plasmablast", seu$cell_type, ignore.case = TRUE) ~ "Plasma cells",
+  grepl("B cell", seu$cell_type, ignore.case = TRUE) ~ "B cells",
+  grepl("monocyte|granulocyte", seu$cell_type, ignore.case = TRUE) ~ "Myeloid cells",
+  grepl("dendritic", seu$cell_type, ignore.case = TRUE) ~ "Dendritic cells",
+  grepl("platelet", seu$cell_type, ignore.case = TRUE) ~ "Platelets",
+  grepl("erythrocyte|RBC", seu$cell_type, ignore.case = TRUE) ~ "Erythroid cells",
+  grepl("precursor|progenitor|HPC", seu$cell_type, ignore.case = TRUE) ~ "Progenitors",
+  TRUE ~ "Other"
+)
+
+seu$broad_cell_type <- factor(
+  seu$broad_cell_type,
+  levels = c(
+    "T cells",
+    "NK cells",
+    "B cells",
+    "Plasma cells",
+    "Myeloid cells",
+    "Dendritic cells",
+    "Platelets",
+    "Erythroid cells",
+    "Progenitors",
+    "Other"
+  )
+)
+
+# =========================================================
+# 8. Broad cell population colors
+# =========================================================
+celltype_palette <- c(
+  "T cells" = "#6A51A3",
+  "NK cells" = "#9ECAE1",
+  "B cells" = "#31A354",
+  "Plasma cells" = "#66C2A4",
+  "Myeloid cells" = "#E67E22",
+  "Dendritic cells" = "#A1D99B",
+  "Platelets" = "#B39DDB",
+  "Erythroid cells" = "#4C78A8",
+  "Progenitors" = "#F2C94C",
+  "Other" = "#BDBDBD"
+)
+
+# =========================================================
+# 9. Slide-style workflow:
+# variable features -> PCA -> neighbors -> cluster -> UMAP
+# =========================================================
+seu <- FindVariableFeatures(
+  seu,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+seu <- ScaleData(
+  seu,
+  features = VariableFeatures(seu),
+  verbose = FALSE
+)
+
+seu <- RunPCA(
+  seu,
+  features = VariableFeatures(seu),
+  npcs = 30,
+  verbose = FALSE
+)
+
+seu <- FindNeighbors(
+  seu,
+  dims = 1:30,
+  verbose = FALSE
+)
+
+seu <- FindClusters(
+  seu,
+  resolution = 0.4,
+  verbose = FALSE
+)
+
+seu <- RunUMAP(
+  seu,
+  dims = 1:30,
+  reduction = "pca",
+  reduction.name = "umap",
+  verbose = FALSE
+)
+
+# =========================================================
+# 10. Prepare dataframe for left UMAP
+# =========================================================
+umap_df <- Embeddings(seu, "umap") %>%
+  as.data.frame()
+
+colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+umap_df$cell <- rownames(umap_df)
+umap_df$broad_cell_type <- seu$broad_cell_type[rownames(umap_df)]
+
+label_df <- umap_df %>%
+  group_by(broad_cell_type) %>%
+  summarise(
+    UMAP_1 = median(UMAP_1, na.rm = TRUE),
+    UMAP_2 = median(UMAP_2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ranges for padding and manual label placement
+x_range <- range(umap_df$UMAP_1, na.rm = TRUE)
+y_range <- range(umap_df$UMAP_2, na.rm = TRUE)
+x_span <- diff(x_range)
+y_span <- diff(y_range)
+
+# manually separate labels
+# Progenitors moved DOWN into the empty space
+label_df <- label_df %>%
+  mutate(
+    label_x = case_when(
+      broad_cell_type == "Progenitors"     ~ UMAP_1 + 0.22 * x_span,
+      broad_cell_type == "Platelets"       ~ UMAP_1 + 0.08 * x_span,
+      broad_cell_type == "Erythroid cells" ~ UMAP_1 + 0.12 * x_span,
+      broad_cell_type == "Plasma cells"    ~ UMAP_1 - 0.03 * x_span,
+      broad_cell_type == "Dendritic cells" ~ UMAP_1 - 0.03 * x_span,
+      TRUE ~ UMAP_1
+    ),
+    label_y = case_when(
+      broad_cell_type == "Progenitors"     ~ UMAP_2 + 0.12 * y_span,
+      broad_cell_type == "Platelets"       ~ UMAP_2 - 0.12 * y_span,
+      broad_cell_type == "Erythroid cells" ~ UMAP_2 - 0.06 * y_span,
+      broad_cell_type == "Dendritic cells" ~ UMAP_2 - 0.04 * y_span,
+      broad_cell_type == "Myeloid cells"   ~ UMAP_2 + 0.02 * y_span,
+      broad_cell_type == "Other"           ~ UMAP_2 - 0.03 * y_span,
+      TRUE ~ UMAP_2
+    )
+  )
+
+# extra plotting space so labels do not get cut off
+x_limits <- c(x_range[1] - 0.04 * x_span, x_range[2] + 0.35 * x_span)
+y_limits <- c(y_range[1] - 0.10 * y_span, y_range[2] + 0.14 * y_span)
+
+# =========================================================
+# 11. Left plot: broad cell populations
+#    colored text + white shadow/halo
+# =========================================================
+p_labels <- ggplot(
+  umap_df,
+  aes(x = UMAP_1, y = UMAP_2, color = broad_cell_type)
+) +
+  geom_point(size = 0.28, alpha = 0.9, show.legend = FALSE) +
+  shadowtext::geom_shadowtext(
+    data = label_df,
+    aes(
+      x = label_x,
+      y = label_y,
+      label = broad_cell_type,
+      color = broad_cell_type
+    ),
+    inherit.aes = FALSE,
+    bg.color = "white",
+    bg.r = 0.20,
+    fontface = "bold",
+    size = 4.6,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = celltype_palette) +
+  coord_cartesian(
+    xlim = x_limits,
+    ylim = y_limits,
+    clip = "off"
+  ) +
+  labs(
+    title = "Cell populations",
+    x = "UMAP1",
+    y = "UMAP2"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.line = element_line(linewidth = 0.6, color = "black"),
+    plot.margin = margin(12, 40, 12, 12),
+    aspect.ratio = 1
+  )
+
+# =========================================================
+# 12. Right plots: gene expression on same UMAP
+# =========================================================
+feature_plots <- lapply(genes_present, function(g) {
+  FeaturePlot(
+    seu,
+    features = g,
+    reduction = "umap",
+    raster = FALSE,
+    order = TRUE,
+    cols = c("#fde5f3", "#ff2ca3")
+  ) +
+    scale_color_gradient(
+      low = "#fde5f3",
+      high = "#ff2ca3",
+      name = "Expression\nlog(CPM/100 + 1)"
+    ) +
+    coord_cartesian(
+      xlim = x_limits,
+      ylim = y_limits,
+      clip = "off"
+    ) +
+    labs(
+      title = g,
+      x = "UMAP1",
+      y = "UMAP2"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.title = element_text(face = "bold", size = 9),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.line = element_line(linewidth = 0.5, color = "black"),
+      legend.position = "right",
+      plot.margin = margin(8, 8, 8, 8),
+      aspect.ratio = 1
+    )
+})
+
+# =========================================================
+# 13. Combine plots
+# =========================================================
+right_panel <- wrap_plots(feature_plots, ncol = 3)
+
+final_umap_plot <- p_labels + right_panel + plot_layout(widths = c(1.18, 1.82))
+
+final_umap_plot
+
+# =========================================================
+# 14. Save
+# =========================================================
+ggsave(
+  filename = "pediatric_blood_umap_shadowtext.png",
+  plot = final_umap_plot,
+  width = 16.5,
+  height = 9,
+  dpi = 300
+)
+```
+
+UMAP 3 - w/ repel away
+
+```{r}
+library(SingleCellExperiment)
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ggrepel)
+library(scales)
+
+set.seed(123)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+# =========================================================
+# 1. Load expression + metadata from QC-filtered object
+# =========================================================
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+if (!"cell_type" %in% colnames(meta)) {
+  stop("cell_type column not found in colData(pbmc_ped_healthy_qc).")
+}
+
+# =========================================================
+# 2. Use gene symbols as row names
+# =========================================================
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name", "name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) {
+  stop("No gene name column found in rowData(pbmc_ped_healthy_qc).")
+}
+
+gene_names <- as.character(rowData(pbmc_ped_healthy_qc)[[gene_col]])
+
+if (length(gene_names) != nrow(expr_mat)) {
+  stop("gene_names length does not match number of rows in expr_mat.")
+}
+
+rownames(expr_mat) <- make.unique(gene_names)
+
+# =========================================================
+# 3. Keep cells with valid cell type annotation
+# =========================================================
+keep_cells <- !is.na(meta$cell_type) & meta$cell_type != ""
+
+meta <- meta[keep_cells, , drop = FALSE]
+expr_mat <- expr_mat[, keep_cells, drop = FALSE]
+
+# =========================================================
+# 4. Downsample for speed
+# =========================================================
+n_umap_cells <- min(50000, ncol(expr_mat))
+
+set.seed(123)
+cells_use <- sample(seq_len(ncol(expr_mat)), n_umap_cells)
+
+expr_use <- expr_mat[, cells_use, drop = FALSE]
+meta_use <- meta[cells_use, , drop = FALSE]
+
+rownames(meta_use) <- colnames(expr_use)
+expr_use <- as(expr_use, "dgCMatrix")
+
+cat("Cells used for UMAP:", ncol(expr_use), "\n")
+
+# =========================================================
+# 5. Check genes
+# =========================================================
+genes_present <- intersect(genes_to_plot, rownames(expr_use))
+
+if (length(genes_present) == 0) {
+  stop("None of the requested genes were found in the matrix.")
+}
+
+cat("Genes found:\n")
+print(genes_present)
+
+cat("\nGenes missing:\n")
+print(setdiff(genes_to_plot, genes_present))
+
+# =========================================================
+# 6. Build Seurat object
+# IMPORTANT:
+# X already appears normalized/transformed, so do NOT
+# run NormalizeData() again.
+# =========================================================
+seu <- CreateSeuratObject(
+  counts = expr_use,
+  meta.data = meta_use,
+  project = "Pediatric_Blood"
+)
+
+DefaultAssay(seu) <- "RNA"
+
+seu <- tryCatch(
+  {
+    SetAssayData(seu, assay = "RNA", layer = "data", new.data = expr_use)
+  },
+  error = function(e) {
+    SetAssayData(seu, assay = "RNA", slot = "data", new.data = expr_use)
+  }
+)
+
+# =========================================================
+# 7. Broad grouped cell-type labels
+#    B vs Plasma split
+#    Platelets vs Erythroid split
+# =========================================================
+seu$broad_cell_type <- case_when(
+  grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", seu$cell_type, ignore.case = TRUE) ~ "T cells",
+  grepl("natural killer|NK", seu$cell_type, ignore.case = TRUE) ~ "NK cells",
+  grepl("plasma|plasmablast", seu$cell_type, ignore.case = TRUE) ~ "Plasma cells",
+  grepl("B cell", seu$cell_type, ignore.case = TRUE) ~ "B cells",
+  grepl("monocyte|granulocyte", seu$cell_type, ignore.case = TRUE) ~ "Myeloid cells",
+  grepl("dendritic", seu$cell_type, ignore.case = TRUE) ~ "Dendritic cells",
+  grepl("platelet", seu$cell_type, ignore.case = TRUE) ~ "Platelets",
+  grepl("erythrocyte|RBC", seu$cell_type, ignore.case = TRUE) ~ "Erythroid cells",
+  grepl("precursor|progenitor|HPC", seu$cell_type, ignore.case = TRUE) ~ "Progenitors",
+  TRUE ~ "Other"
+)
+
+seu$broad_cell_type <- factor(
+  seu$broad_cell_type,
+  levels = c(
+    "T cells",
+    "NK cells",
+    "B cells",
+    "Plasma cells",
+    "Myeloid cells",
+    "Dendritic cells",
+    "Platelets",
+    "Erythroid cells",
+    "Progenitors",
+    "Other"
+  )
+)
+
+# =========================================================
+# 8. Broad cell population colors
+# =========================================================
+celltype_palette <- c(
+  "T cells" = "#6A51A3",
+  "NK cells" = "#9ECAE1",
+  "B cells" = "#31A354",
+  "Plasma cells" = "#66C2A4",
+  "Myeloid cells" = "#E67E22",
+  "Dendritic cells" = "#A1D99B",
+  "Platelets" = "#B39DDB",
+  "Erythroid cells" = "#4C78A8",
+  "Progenitors" = "#F2C94C",
+  "Other" = "#BDBDBD"
+)
+
+# =========================================================
+# 9. Slide-style workflow:
+# variable features -> PCA -> neighbors -> cluster -> UMAP
+# =========================================================
+seu <- FindVariableFeatures(
+  seu,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+seu <- ScaleData(
+  seu,
+  features = VariableFeatures(seu),
+  verbose = FALSE
+)
+
+seu <- RunPCA(
+  seu,
+  features = VariableFeatures(seu),
+  npcs = 30,
+  verbose = FALSE
+)
+
+seu <- FindNeighbors(
+  seu,
+  dims = 1:30,
+  verbose = FALSE
+)
+
+seu <- FindClusters(
+  seu,
+  resolution = 0.4,
+  verbose = FALSE
+)
+
+seu <- RunUMAP(
+  seu,
+  dims = 1:30,
+  reduction = "pca",
+  reduction.name = "umap",
+  verbose = FALSE
+)
+
+# =========================================================
+# 10. Prepare dataframe for plotting
+# =========================================================
+umap_df <- Embeddings(seu, "umap") %>%
+  as.data.frame()
+
+colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+umap_df$cell <- rownames(umap_df)
+umap_df$broad_cell_type <- seu$broad_cell_type[rownames(umap_df)]
+
+label_df <- umap_df %>%
+  group_by(broad_cell_type) %>%
+  summarise(
+    UMAP_1 = median(UMAP_1, na.rm = TRUE),
+    UMAP_2 = median(UMAP_2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# =========================================================
+# 11. Expand plot limits so labels do not get cut off
+# =========================================================
+x_range <- range(umap_df$UMAP_1, na.rm = TRUE)
+y_range <- range(umap_df$UMAP_2, na.rm = TRUE)
+x_span <- diff(x_range)
+y_span <- diff(y_range)
+
+# Give extra room on all sides, especially right/top for repelled labels
+x_limits <- c(x_range[1] - 0.12 * x_span, x_range[2] + 0.38 * x_span)
+y_limits <- c(y_range[1] - 0.12 * y_span, y_range[2] + 0.20 * y_span)
+
+# =========================================================
+# 12. Left plot: broad cell populations with ggrepel
+#     labels moved away so clusters stay visible
+# =========================================================
+p_labels <- ggplot(
+  umap_df,
+  aes(x = UMAP_1, y = UMAP_2, color = broad_cell_type)
+) +
+  geom_point(size = 0.28, alpha = 0.9, show.legend = FALSE) +
+  ggrepel::geom_label_repel(
+    data = label_df,
+    aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      label = broad_cell_type,
+      color = broad_cell_type
+    ),
+    inherit.aes = FALSE,
+    fill = alpha("white", 0.92),
+    fontface = "bold",
+    size = 5,
+    label.size = 0,
+    box.padding = 1.2,
+    point.padding = 1.0,
+    force = 3.5,
+    force_pull = 0.2,
+    max.overlaps = Inf,
+    min.segment.length = 0,
+    segment.color = "grey55",
+    segment.size = 0.4,
+    segment.alpha = 0.8,
+    seed = 123,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = celltype_palette) +
+  coord_cartesian(
+    xlim = x_limits,
+    ylim = y_limits,
+    clip = "off"
+  ) +
+  labs(
+    title = "Cell populations",
+    x = "UMAP1",
+    y = "UMAP2"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.line = element_line(linewidth = 0.6, color = "black"),
+    plot.margin = margin(18, 85, 18, 18),
+    aspect.ratio = 1
+  )
+
+# =========================================================
+# 13. Right plots: gene expression on same UMAP
+# =========================================================
+feature_plots <- lapply(genes_present, function(g) {
+  FeaturePlot(
+    seu,
+    features = g,
+    reduction = "umap",
+    raster = FALSE,
+    order = TRUE,
+    cols = c("#fde5f3", "#ff2ca3")
+  ) +
+    scale_color_gradient(
+      low = "#fde5f3",
+      high = "#ff2ca3",
+      name = "Expression\nlog(CPM/100 + 1)"
+    ) +
+    coord_cartesian(
+      xlim = x_limits,
+      ylim = y_limits,
+      clip = "off"
+    ) +
+    labs(
+      title = g,
+      x = "UMAP1",
+      y = "UMAP2"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.title = element_text(face = "bold", size = 9),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.line = element_line(linewidth = 0.5, color = "black"),
+      legend.position = "right",
+      plot.margin = margin(10, 12, 10, 12),
+      aspect.ratio = 1
+    )
+})
+
+# =========================================================
+# 14. Combine plots
+# =========================================================
+right_panel <- wrap_plots(feature_plots, ncol = 3)
+
+final_umap_plot <- p_labels + right_panel + plot_layout(widths = c(1.25, 1.85))
+
+final_umap_plot
+
+# =========================================================
+# 15. Save with larger dimensions so labels are not cut off
+# =========================================================
+ggsave(
+  filename = "pediatric_blood_umap_ggrepel_clearlabels.png",
+  plot = final_umap_plot,
+  width = 22,
+  height = 12,
+  dpi = 400,
+  limitsize = FALSE
+)
+```
+
+NO downsampling :
+
+```{r}
+library(SingleCellExperiment)
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ggrepel)
+library(scales)
+
+set.seed(123)
+
+genes_to_plot <- c("CD24", "SIGLEC10", "NECTIN4", "CDH1", "ST8SIA1", "B4GALNT1")
+
+# =========================================================
+# 1. Load expression + metadata from QC-filtered object
+# =========================================================
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+if (!"cell_type" %in% colnames(meta)) {
+  stop("cell_type column not found in colData(pbmc_ped_healthy_qc).")
+}
+
+# =========================================================
+# 2. Use gene symbols as row names
+# =========================================================
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name", "name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) {
+  stop("No gene name column found in rowData(pbmc_ped_healthy_qc).")
+}
+
+gene_names <- as.character(rowData(pbmc_ped_healthy_qc)[[gene_col]])
+
+if (length(gene_names) != nrow(expr_mat)) {
+  stop("gene_names length does not match number of rows in expr_mat.")
+}
+
+rownames(expr_mat) <- make.unique(gene_names)
+
+# =========================================================
+# 3. Keep cells with valid cell type annotation
+# =========================================================
+keep_cells <- !is.na(meta$cell_type) & meta$cell_type != ""
+
+meta_use <- meta[keep_cells, , drop = FALSE]
+expr_use <- expr_mat[, keep_cells, drop = FALSE]
+
+rownames(meta_use) <- colnames(expr_use)
+expr_use <- as(expr_use, "dgCMatrix")
+
+cat("Cells used for UMAP:", ncol(expr_use), "\n")
+
+# =========================================================
+# 4. Check requested genes
+# =========================================================
+genes_present <- intersect(genes_to_plot, rownames(expr_use))
+
+if (length(genes_present) == 0) {
+  stop("None of the requested genes were found in the matrix.")
+}
+
+cat("Genes found:\n")
+print(genes_present)
+
+cat("\nGenes missing:\n")
+print(setdiff(genes_to_plot, genes_present))
+
+# =========================================================
+# 5. Build Seurat object
+# =========================================================
+seu <- CreateSeuratObject(
+  counts = expr_use,
+  meta.data = meta_use,
+  project = "Pediatric_Blood_All_Cells"
+)
+
+DefaultAssay(seu) <- "RNA"
+
+# Put already-normalized X values into the data slot/layer
+seu <- tryCatch(
+  {
+    SetAssayData(seu, assay = "RNA", layer = "data", new.data = expr_use)
+  },
+  error = function(e) {
+    SetAssayData(seu, assay = "RNA", slot = "data", new.data = expr_use)
+  }
+)
+
+# =========================================================
+# 6. Broad grouped cell-type labels
+#    B vs Plasma split
+#    Platelets vs Erythroid split
+# =========================================================
+seu$broad_cell_type <- case_when(
+  grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", seu$cell_type, ignore.case = TRUE) ~ "T cells",
+  grepl("natural killer|NK", seu$cell_type, ignore.case = TRUE) ~ "NK cells",
+  grepl("plasma|plasmablast", seu$cell_type, ignore.case = TRUE) ~ "Plasma cells",
+  grepl("B cell", seu$cell_type, ignore.case = TRUE) ~ "B cells",
+  grepl("monocyte|granulocyte", seu$cell_type, ignore.case = TRUE) ~ "Myeloid cells",
+  grepl("dendritic", seu$cell_type, ignore.case = TRUE) ~ "Dendritic cells",
+  grepl("platelet", seu$cell_type, ignore.case = TRUE) ~ "Platelets",
+  grepl("erythrocyte|RBC", seu$cell_type, ignore.case = TRUE) ~ "Erythroid cells",
+  grepl("precursor|progenitor|HPC", seu$cell_type, ignore.case = TRUE) ~ "Progenitors",
+  TRUE ~ "Other"
+)
+
+seu$broad_cell_type <- factor(
+  seu$broad_cell_type,
+  levels = c(
+    "T cells",
+    "NK cells",
+    "B cells",
+    "Plasma cells",
+    "Myeloid cells",
+    "Dendritic cells",
+    "Platelets",
+    "Erythroid cells",
+    "Progenitors",
+    "Other"
+  )
+)
+
+# =========================================================
+# 7. Broad cell population colors
+# =========================================================
+celltype_palette <- c(
+  "T cells" = "#6A51A3",
+  "NK cells" = "#9ECAE1",
+  "B cells" = "#31A354",
+  "Plasma cells" = "#66C2A4",
+  "Myeloid cells" = "#E67E22",
+  "Dendritic cells" = "#A1D99B",
+  "Platelets" = "#B39DDB",
+  "Erythroid cells" = "#4C78A8",
+  "Progenitors" = "#F2C94C",
+  "Other" = "#BDBDBD"
+)
+
+# =========================================================
+# 8. UMAP workflow on ALL cells:
+# =========================================================
+seu <- FindVariableFeatures(
+  seu,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+seu <- ScaleData(
+  seu,
+  features = VariableFeatures(seu),
+  verbose = FALSE
+)
+
+seu <- RunPCA(
+  seu,
+  features = VariableFeatures(seu),
+  npcs = 30,
+  verbose = FALSE
+)
+
+seu <- FindNeighbors(
+  seu,
+  dims = 1:30,
+  verbose = FALSE
+)
+
+seu <- FindClusters(
+  seu,
+  resolution = 0.4,
+  verbose = FALSE
+)
+
+seu <- RunUMAP(
+  seu,
+  dims = 1:30,
+  reduction = "pca",
+  reduction.name = "umap",
+  verbose = FALSE
+)
+
+# =========================================================
+# 9. Prepare dataframe for broad cell-type UMAP
+# =========================================================
+umap_df <- Embeddings(seu, "umap") %>%
+  as.data.frame()
+
+colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+umap_df$cell <- rownames(umap_df)
+umap_df$broad_cell_type <- seu$broad_cell_type[rownames(umap_df)]
+
+label_df <- umap_df %>%
+  group_by(broad_cell_type) %>%
+  summarise(
+    UMAP_1 = median(UMAP_1, na.rm = TRUE),
+    UMAP_2 = median(UMAP_2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# =========================================================
+# 10. Expand limits so labels do not get cut off
+# =========================================================
+x_range <- range(umap_df$UMAP_1, na.rm = TRUE)
+y_range <- range(umap_df$UMAP_2, na.rm = TRUE)
+x_span <- diff(x_range)
+y_span <- diff(y_range)
+
+x_limits <- c(x_range[1] - 0.12 * x_span, x_range[2] + 0.38 * x_span)
+y_limits <- c(y_range[1] - 0.12 * y_span, y_range[2] + 0.20 * y_span)
+
+# =========================================================
+# 11. Left UMAP: broad cell populations with ggrepel labels
+# =========================================================
+p_labels <- ggplot(
+  umap_df,
+  aes(x = UMAP_1, y = UMAP_2, color = broad_cell_type)
+) +
+  geom_point(size = 0.18, alpha = 0.75, show.legend = FALSE) +
+  ggrepel::geom_label_repel(
+    data = label_df,
+    aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      label = broad_cell_type,
+      color = broad_cell_type
+    ),
+    inherit.aes = FALSE,
+    fill = scales::alpha("white", 0.92),
+    fontface = "bold",
+    size = 4.6,
+    label.size = 0,
+    box.padding = 1.2,
+    point.padding = 1.0,
+    force = 3.5,
+    force_pull = 0.2,
+    max.overlaps = Inf,
+    min.segment.length = 0,
+    segment.color = "grey55",
+    segment.size = 0.4,
+    segment.alpha = 0.8,
+    seed = 123,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = celltype_palette) +
+  coord_cartesian(
+    xlim = x_limits,
+    ylim = y_limits,
+    clip = "off"
+  ) +
+  labs(
+    title = "Cell populations",
+    x = "UMAP1",
+    y = "UMAP2"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.line = element_line(linewidth = 0.6, color = "black"),
+    plot.margin = margin(18, 85, 18, 18),
+    aspect.ratio = 1
+  )
+
+# =========================================================
+# 12. Right UMAPs: gene expression on same UMAP
+# =========================================================
+feature_plots <- lapply(genes_present, function(g) {
+  FeaturePlot(
+    seu,
+    features = g,
+    reduction = "umap",
+    raster = FALSE,
+    order = TRUE,
+    cols = c("#fde5f3", "#ff2ca3")
+  ) +
+    scale_color_gradient(
+      low = "#fde5f3",
+      high = "#ff2ca3",
+      name = "Expression\nlog(CPM/100 + 1)"
+    ) +
+    coord_cartesian(
+      xlim = x_limits,
+      ylim = y_limits,
+      clip = "off"
+    ) +
+    labs(
+      title = g,
+      x = "UMAP1",
+      y = "UMAP2"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.title = element_text(face = "bold", size = 9),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.line = element_line(linewidth = 0.5, color = "black"),
+      legend.position = "right",
+      plot.margin = margin(10, 12, 10, 12),
+      aspect.ratio = 1
+    )
+})
+
+# =========================================================
+# 13. Combine plots
+# =========================================================
+right_panel <- wrap_plots(feature_plots, ncol = 3)
+
+final_umap_plot <- p_labels + right_panel + plot_layout(widths = c(1.25, 1.85))
+
+final_umap_plot
+
+# =========================================================
+# 14. Save
+# =========================================================
+ggsave(
+  filename = "pediatric_blood_umap_all_cells_no_downsampling.png",
+  plot = final_umap_plot,
+  width = 18,
+  height = 10,
+  dpi = 300,
+  limitsize = FALSE
+)
+```
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# Clean memory first
+rm(list = setdiff(ls(), c("pbmc_ped_healthy_qc")))
+gc()
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+# Main expression matrix
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+
+# Gene names
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) stop("No gene name column found.")
+
+gene_names <- rowData(pbmc_ped_healthy_qc)[[gene_col]]
+
+# Metadata
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+# Keep valid cells
+keep_cells <- !is.na(meta$cell_type) & meta$cell_type != "" &
+              !is.na(meta$patient_id) & meta$patient_id != ""
+
+meta <- meta[keep_cells, , drop = FALSE]
+expr_mat <- expr_mat[, keep_cells, drop = FALSE]
+
+# Broad cell classes
+meta <- meta %>%
+  mutate(
+    cell_class = case_when(
+      grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", cell_type, ignore.case = TRUE) ~ "T cell",
+      grepl("natural killer|NK", cell_type, ignore.case = TRUE) ~ "NK cell",
+      grepl("B cell|plasma|plasmablast", cell_type, ignore.case = TRUE) ~ "B / plasma",
+      grepl("monocyte|granulocyte", cell_type, ignore.case = TRUE) ~ "Myeloid",
+      grepl("dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("erythrocyte|platelet", cell_type, ignore.case = TRUE) ~ "Erythroid / platelet",
+      grepl("precursor", cell_type, ignore.case = TRUE) ~ "Progenitor",
+      TRUE ~ "Other"
+    )
+  )
+
+# Keep requested genes
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) stop("None of the requested genes were found.")
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+# IMPORTANT:
+# Pull only these 2 genes into memory as a small dense matrix
+expr_sub <- as.matrix(expr_mat[gene_idx, , drop = FALSE])
+rownames(expr_sub) <- genes_present
+
+# Drop the huge backed matrix now
+rm(expr_mat)
+gc()
+
+cell_classes <- c(
+  "B / plasma",
+  "Dendritic",
+  "Erythroid / platelet",
+  "Myeloid",
+  "NK cell",
+  "Progenitor",
+  "T cell",
+  "Other"
+)
+cell_classes <- cell_classes[cell_classes %in% unique(meta$cell_class)]
+
+class_fac <- factor(meta$cell_class, levels = cell_classes)
+
+# Safe averaging: no large matrix slicing inside loops
+avg_mat <- t(sapply(seq_len(nrow(expr_sub)), function(i) {
+  out <- tapply(expr_sub[i, ], class_fac, mean, na.rm = TRUE)
+  out[cell_classes]
+}))
+
+avg_mat <- as.matrix(avg_mat)
+rownames(avg_mat) <- genes_present
+colnames(avg_mat) <- cell_classes
+
+# Rows = broad cell classes
+heatmap_mat <- t(avg_mat)
+heatmap_mat[is.na(heatmap_mat)] <- 0
+
+# Donor count (d) and cell count (n)
+label_df <- meta %>%
+  group_by(cell_class) %>%
+  summarise(
+    d = n_distinct(patient_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[match(rownames(heatmap_mat), label_df$cell_class), ]
+
+rownames(heatmap_mat) <- paste0(
+  label_df$cell_class,
+  " (d = ", label_df$d, ", n = ", label_df$n, ")"
+)
+
+legend_min <- 0
+legend_max <- as.numeric(quantile(heatmap_mat, probs = 0.99, na.rm = TRUE))
+legend_mid <- legend_max / 2
+
+col_fun <- colorRamp2(
+  c(legend_min, legend_mid, legend_max),
+  c("#2166AC", "#D0D0D0", "#B2182B")
+)
+
+legend_ticks <- pretty(c(legend_min, legend_max), n = 5)
+legend_ticks <- legend_ticks[legend_ticks >= legend_min & legend_ticks <= legend_max]
+
+ht <- Heatmap(
+  heatmap_mat,
+  name = "Mean expression\nlog(CPM/100 + 1)",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = NA),
+
+  width = unit(3.2, "cm"),
+  height = unit(10.5, "cm"),
+
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 16, fontface = "bold"),
+  row_names_max_width = unit(12, "cm"),
+  show_column_names = TRUE,
+  column_names_gp = gpar(fontsize = 16, fontface = "bold"),
+
+  heatmap_legend_param = list(
+    title = "Mean expression\nlog(CPM/100 + 1)\n",
+    title_position = "leftcenter-rot",
+    at = legend_ticks,
+    labels = round(legend_ticks, 2),
+    legend_height = unit(60, "mm"),
+    title_gp = gpar(fontsize = 14, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12, fontface = "bold")
+  ),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- heatmap_mat[i, j]
+    lab <- if (is.na(val) || val < 0.005) "0" else sprintf("%.2f", val)
+    grid.text(
+      lab,
+      x, y,
+      gp = gpar(fontsize = 13, fontface = "bold", col = "black")
+    )
+  }
+)
+
+png(
+  "pediatric_healthy_heatmap_broad_classes_quantile99_cd24_siglec10.png",
+  width = 2800,
+  height = 2200,
+  res = 300
+)
+draw(ht, heatmap_legend_side = "right")
+dev.off()
+```
