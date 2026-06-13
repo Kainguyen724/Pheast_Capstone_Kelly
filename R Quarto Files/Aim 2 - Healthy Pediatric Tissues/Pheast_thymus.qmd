@@ -1,0 +1,1122 @@
+---
+title: "Pheast_thymus_Tissue_1"
+format: html
+editor: visual
+---
+
+Dataset :
+
+## Loading Dataset
+
+```{r}
+
+library(zellkonverter)
+library(SingleCellExperiment)
+
+# Load the file you already downloaded
+thymus_sce <- readH5AD(
+  "f73a73b4-baee-4ed4-bcd3-266d42fdad6a.h5ad",
+  use_hdf5 = TRUE
+)
+
+# =========================================================
+# BASIC INFO
+# =========================================================
+
+thymus_sce
+
+dim(thymus_sce)
+
+assayNames(thymus_sce)
+
+# =========================================================
+# METADATA
+# =========================================================
+
+colnames(colData(thymus_sce))
+
+head(as.data.frame(colData(thymus_sce)))
+
+# =========================================================
+# CHECK CELL TYPE COLUMNS
+# =========================================================
+
+grep(
+  "cell|type|annot|cluster",
+  colnames(colData(thymus_sce)),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+# =========================================================
+# CHECK AGE / DEVELOPMENT COLUMNS
+# =========================================================
+
+grep(
+  "age|development|stage",
+  colnames(colData(thymus_sce)),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+# =========================================================
+# CHECK HEALTH / DISEASE COLUMNS
+# =========================================================
+
+grep(
+  "disease|health|normal",
+  colnames(colData(thymus_sce)),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+# =========================================================
+# CHECK TISSUE COLUMNS
+# =========================================================
+
+grep(
+  "tissue",
+  colnames(colData(thymus_sce)),
+  value = TRUE,
+  ignore.case = TRUE
+)
+```
+
+```{r}
+# Inspect thymus atlas metadata
+
+meta <- as.data.frame(colData(thymus_sce))
+
+# Metadata columns
+cat("Metadata columns:\n")
+print(colnames(meta))
+
+# Search for age columns
+cat("\nPossible age columns:\n")
+
+print(
+  grep(
+    "age|development|stage",
+    colnames(meta),
+    value = TRUE,
+    ignore.case = TRUE
+  )
+)
+
+# Search for disease/health columns
+cat("\nPossible disease/health columns:\n")
+
+print(
+  grep(
+    "disease|health|normal",
+    colnames(meta),
+    value = TRUE,
+    ignore.case = TRUE
+  )
+)
+
+# Search for tissue columns
+cat("\nPossible tissue columns:\n")
+
+print(
+  grep(
+    "tissue|organ",
+    colnames(meta),
+    value = TRUE,
+    ignore.case = TRUE
+  )
+)
+
+# Search for cell type annotation columns
+cat("\nPossible cell type columns:\n")
+
+print(
+  grep(
+    "cell|type|annot|cluster",
+    colnames(meta),
+    value = TRUE,
+    ignore.case = TRUE
+  )
+)
+
+# Donor IDs
+cat("\nDonor IDs:\n")
+print(table(meta$donor_id))
+
+# Preview metadata
+cat("\nMetadata preview:\n")
+print(head(meta))
+
+# Dataset dimensions
+cat("\nDataset dimensions:\n")
+print(dim(thymus_sce))
+
+# Assays
+cat("\nAssays:\n")
+print(assayNames(thymus_sce))
+```
+
+```{r}
+# Check assays available
+assayNames(thymus_sce)
+
+# Inspect assay dimensions
+lapply(assayNames(thymus_sce), function(x) {
+  dim(assay(thymus_sce, x))
+})
+
+# Summary statistics of expression values
+summary(as.vector(assay(thymus_sce, "X")[1:1000, 1]))
+
+# Check min/max values
+range(assay(thymus_sce, "X"))
+
+# Look at a small subset of values
+assay(thymus_sce, "X")[1:10, 1:10]
+
+# Check if values appear integer-like
+head(unique(round(assay(thymus_sce, "X")[1:100,1], 5)))
+
+# Check metadata for normalization clues
+metadata(thymus_sce)
+
+# Search metadata names
+names(metadata(thymus_sce))
+
+# Check uns metadata if present
+int_metadata(thymus_sce)
+
+# Look for log-normalization clues
+grep(
+  "norm|log|scale|CPM|TPM",
+  capture.output(str(metadata(thymus_sce))),
+  value = TRUE,
+  ignore.case = TRUE
+)
+```
+
+### Filter:
+
+```{r}
+# Filter healthy pediatric thymus cells
+
+meta <- as.data.frame(colData(thymus_sce))
+
+# Keep pediatric samples
+ped_keep <- grepl(
+  "month|year",
+  meta$development_stage,
+  ignore.case = TRUE
+)
+
+# Remove adult samples
+adult_remove <- grepl(
+  "adult",
+  meta$development_stage,
+  ignore.case = TRUE
+)
+
+# Keep healthy/normal thymus
+healthy_keep <- meta$disease == "normal"
+
+# Keep thymus tissue
+thymus_keep <- meta$tissue == "thymus"
+
+# Final filter
+keep_cells <- ped_keep &
+              !adult_remove &
+              healthy_keep &
+              thymus_keep
+
+thymus_ped_healthy <- thymus_sce[, keep_cells]
+
+# Summary
+cat("Cells before filtering:",
+    ncol(thymus_sce), "\n")
+
+cat("Cells after filtering:",
+    ncol(thymus_ped_healthy), "\n")
+
+cat("\nDevelopment stages kept:\n")
+
+print(
+  table(
+    colData(thymus_ped_healthy)$development_stage
+  )
+)
+
+cat("\nDisease labels kept:\n")
+
+print(
+  table(
+    colData(thymus_ped_healthy)$disease
+  )
+)
+
+cat("\nTissues kept:\n")
+
+print(
+  table(
+    colData(thymus_ped_healthy)$tissue
+  )
+)
+
+cat("\nCell types:\n")
+
+print(
+  sort(
+    table(colData(thymus_ped_healthy)$cell_type),
+    decreasing = TRUE
+  )
+)
+```
+
+### QC:
+
+```{r}
+# QC for healthy pediatric thymus dataset
+
+library(scuttle)
+library(Matrix)
+library(dplyr)
+
+# Gene names
+gene_names <- rownames(thymus_ped_healthy)
+
+# Mitochondrial genes
+is_mito <- grepl(
+  "^MT-",
+  gene_names
+)
+
+# Ribosomal genes
+is_ribo <- grepl(
+  "^RPL|^RPS",
+  gene_names
+)
+
+# Add QC metrics
+thymus_ped_healthy <- addPerCellQCMetrics(
+  thymus_ped_healthy,
+  subsets = list(
+    Mito = is_mito,
+    Ribo = is_ribo
+  ),
+  assay.type = "X"
+)
+
+qc <- as.data.frame(
+  colData(thymus_ped_healthy)
+)
+
+# Visualize QC distributions
+par(mfrow = c(1, 3))
+
+hist(
+  qc$detected,
+  breaks = 50,
+  main = "Detected genes",
+  xlab = "Detected"
+)
+
+hist(
+  qc$sum,
+  breaks = 50,
+  main = "Expression totals",
+  xlab = "Total expression"
+)
+
+hist(
+  qc$subsets_Mito_percent,
+  breaks = 50,
+  main = "Mito %",
+  xlab = "Percent mito"
+)
+
+par(mfrow = c(1,1))
+
+# QC filters
+keep <- qc$detected >= 200 &
+        qc$subsets_Mito_percent <= 20
+
+thymus_ped_healthy_qc <- thymus_ped_healthy[, keep]
+
+# QC dataframe
+qc_df <- data.frame(
+  donor_id = qc$donor_id,
+  development_stage = qc$development_stage,
+  disease = qc$disease,
+  cell_type = qc$cell_type,
+  detected = qc$detected,
+  total_expression = qc$sum,
+  mito_percent = qc$subsets_Mito_percent,
+  ribo_percent = qc$subsets_Ribo_percent,
+  keep = keep,
+  stringsAsFactors = FALSE
+)
+
+# Sample-level summary
+sample_qc_df <- qc_df %>%
+  group_by(
+    donor_id,
+    development_stage
+  ) %>%
+  summarise(
+    n_cells_before_qc = n(),
+    n_cells_after_qc = sum(keep, na.rm = TRUE),
+    median_detected = median(detected, na.rm = TRUE),
+    median_expression = median(total_expression, na.rm = TRUE),
+    median_mito = median(mito_percent, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Outputs
+cat("Cells before QC:",
+    ncol(thymus_ped_healthy), "\n")
+
+cat("Cells after QC:",
+    ncol(thymus_ped_healthy_qc), "\n")
+
+cat("\nQC dataframe dimensions:\n")
+print(dim(qc_df))
+
+cat("\nSample QC summary:\n")
+print(sample_qc_df)
+
+cat("\nCell types after QC:\n")
+
+print(
+  sort(
+    table(colData(thymus_ped_healthy_qc)$cell_type),
+    decreasing = TRUE
+  )
+)
+```
+
+```{r}
+# Check rowData columns
+colnames(rowData(thymus_ped_healthy_qc))
+
+# Preview gene metadata
+head(as.data.frame(rowData(thymus_ped_healthy_qc)))
+
+# Preview rownames
+head(rownames(thymus_ped_healthy_qc))
+```
+
+### Heatmaps:
+
+#### broad:
+
+```{r}
+# Broad Cell Type Heatmap
+# Thymus presentation version
+
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+expr_mat <- assay(thymus_ped_healthy_qc, "X")
+
+gene_names <- as.character(
+  rowData(thymus_ped_healthy_qc)$feature_name
+)
+
+thymus_broad_meta <- as.data.frame(colData(thymus_ped_healthy_qc))
+
+keep_cells <- !is.na(thymus_broad_meta$cell_type) &
+              thymus_broad_meta$cell_type != "" &
+              !is.na(thymus_broad_meta$donor_id)
+
+thymus_broad_meta <- thymus_broad_meta[keep_cells, , drop = FALSE]
+expr_mat <- expr_mat[, keep_cells, drop = FALSE]
+
+thymus_broad_meta <- thymus_broad_meta %>%
+  mutate(
+    broad_class = case_when(
+      grepl("T cell|thymocyte|pro-T|ETP", cell_type, ignore.case = TRUE) ~ "T lineage",
+      grepl("B cell|plasma", cell_type, ignore.case = TRUE) ~ "B lineage",
+      grepl("dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("macrophage|monocyte|myeloid", cell_type, ignore.case = TRUE) ~ "Myeloid",
+      grepl("epithelial", cell_type, ignore.case = TRUE) ~ "Epithelial",
+      TRUE ~ "Other"
+    )
+  )
+
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+expr_sub <- expr_mat[gene_idx, , drop = FALSE]
+rownames(expr_sub) <- genes_present
+
+broad_classes <- unique(thymus_broad_meta$broad_class)
+
+avg_mat <- sapply(broad_classes, function(ct) {
+
+  cols <- which(thymus_broad_meta$broad_class == ct)
+
+  Matrix::rowMeans(
+    expr_sub[, cols, drop = FALSE]
+  )
+})
+
+avg_mat <- as.matrix(avg_mat)
+
+heatmap_mat <- t(avg_mat)
+
+label_df <- thymus_broad_meta %>%
+  group_by(broad_class) %>%
+  summarise(
+    d = n_distinct(donor_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[
+  match(
+    rownames(heatmap_mat),
+    label_df$broad_class
+  ),
+]
+
+rownames(heatmap_mat) <- paste0(
+  label_df$broad_class,
+  " (d=",
+  label_df$d,
+  ", n=",
+  label_df$n,
+  ")"
+)
+
+legend_max <- as.numeric(
+  quantile(
+    as.numeric(heatmap_mat),
+    0.99,
+    na.rm = TRUE
+  )
+)
+
+col_fun <- colorRamp2(
+  c(0, legend_max / 2, legend_max),
+  c("#2166AC", "#D0D0D0", "#B2182B")
+)
+
+ht <- Heatmap(
+  heatmap_mat,
+
+  name = "Mean expression\nlog(CPM/100 + 1)",
+
+  col = col_fun,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+
+  row_names_side = "left",
+
+  rect_gp = gpar(
+    col = "white",
+    lwd = 1.2
+  ),
+
+  row_names_gp = gpar(
+    fontsize = 15,
+    fontface = "bold"
+  ),
+
+  row_names_max_width = unit(
+    12,
+    "cm"
+  ),
+
+  column_names_gp = gpar(
+    fontsize = 18,
+    fontface = "bold"
+  ),
+
+  column_names_rot = 45,
+
+  width = unit(
+    6,
+    "cm"
+  ),
+
+  height = unit(
+    12,
+    "cm"
+  ),
+
+  heatmap_legend_param = list(
+    title_gp = gpar(
+      fontsize = 15,
+      fontface = "bold"
+    ),
+    labels_gp = gpar(
+      fontsize = 13,
+      fontface = "bold"
+    )
+  ),
+
+  cell_fun = function(
+    j, i, x, y,
+    width, height,
+    fill
+  ) {
+
+    val <- heatmap_mat[i, j]
+
+    grid.text(
+      sprintf("%.4f", val),
+      x,
+      y,
+      gp = gpar(
+        fontsize = 11,
+        fontface = "bold",
+        col = "black"
+      )
+    )
+  }
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+png(
+  "thymus_CD24_SIGLEC10_broad_presentation.png",
+  width = 3200,
+  height = 3600,
+  res = 300
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+dev.off()
+```
+
+#### horizontal, long
+
+```{r}
+# Horizontal Long Heatmap
+# Thymus detailed cell types grouped by broad lineage
+
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+expr_mat <- assay(
+  thymus_ped_healthy_qc,
+  "X"
+)
+
+gene_names <- as.character(
+  rowData(thymus_ped_healthy_qc)$feature_name
+)
+
+thymus_heatmap_meta <- as.data.frame(
+  colData(thymus_ped_healthy_qc)
+)
+
+keep_cells <- !is.na(thymus_heatmap_meta$cell_type) &
+              thymus_heatmap_meta$cell_type != "" &
+              !is.na(thymus_heatmap_meta$donor_id)
+
+thymus_heatmap_meta <- thymus_heatmap_meta[
+  keep_cells,
+  ,
+  drop = FALSE
+]
+
+expr_mat <- expr_mat[
+  ,
+  keep_cells,
+  drop = FALSE
+]
+
+gene_idx <- match(
+  genes_to_plot,
+  gene_names
+)
+
+present <- !is.na(gene_idx)
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+expr_sub <- expr_mat[
+  gene_idx,
+  ,
+  drop = FALSE
+]
+
+rownames(expr_sub) <- genes_present
+
+# ------------------------------------
+# Order detailed thymus cell types by broad lineage
+# No top group labels, only ordering
+# ------------------------------------
+
+cell_types <- unique(
+  thymus_heatmap_meta$cell_type
+)
+
+cell_type_info <- data.frame(
+  cell_type = cell_types,
+  stringsAsFactors = FALSE
+)
+
+cell_type_info$cell_group <- case_when(
+
+  # B lineage first
+  grepl(
+    "B cell|plasma|plasmablast",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "B lineage",
+
+  # T lineage
+  grepl(
+    "T cell|thymocyte|pro-T|mature T|CD4|CD8|Treg|regulatory T|alpha-beta|gamma-delta",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "T lineage",
+
+  # Dendritic cells
+  grepl(
+    "dendritic|plasmacytoid dendritic|conventional dendritic|pre-conventional dendritic|DC|pDC|cDC",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Dendritic cells",
+
+  # Myeloid cells
+  grepl(
+    "monocyte|macrophage|granulocyte|myeloid",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Myeloid cells",
+
+  # NK / ILC
+  grepl(
+    "natural killer|\\bNK\\b|innate lymphoid|\\bILC\\b",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "NK / ILC",
+
+  # Erythroid
+  grepl(
+    "erythroid|erythrocyte",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Erythroid",
+
+  # Progenitors
+  grepl(
+    "hematopoietic precursor|progenitor|precursor",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Progenitors",
+
+  TRUE ~ "Other"
+)
+
+group_order <- c(
+  "B lineage",
+  "T lineage",
+  "Dendritic cells",
+  "Myeloid cells",
+  "NK / ILC",
+  "Erythroid",
+  "Progenitors",
+  "Other"
+)
+
+cell_type_info$cell_group <- factor(
+  cell_type_info$cell_group,
+  levels = group_order
+)
+
+# Optional: make a cleaner order inside each group
+cell_type_info$cell_type_order <- case_when(
+  grepl("naive B", cell_type_info$cell_type, ignore.case = TRUE) ~ 1,
+  grepl("immature B", cell_type_info$cell_type, ignore.case = TRUE) ~ 2,
+  grepl("mature B", cell_type_info$cell_type, ignore.case = TRUE) ~ 3,
+  grepl("plasma", cell_type_info$cell_type, ignore.case = TRUE) ~ 4,
+
+  grepl("pro-T", cell_type_info$cell_type, ignore.case = TRUE) ~ 10,
+  grepl("thymocyte", cell_type_info$cell_type, ignore.case = TRUE) ~ 11,
+  grepl("mature T", cell_type_info$cell_type, ignore.case = TRUE) ~ 12,
+
+  grepl("plasmacytoid dendritic", cell_type_info$cell_type, ignore.case = TRUE) ~ 20,
+  grepl("conventional dendritic", cell_type_info$cell_type, ignore.case = TRUE) ~ 21,
+  grepl("pre-conventional dendritic", cell_type_info$cell_type, ignore.case = TRUE) ~ 22,
+
+  grepl("monocyte", cell_type_info$cell_type, ignore.case = TRUE) ~ 30,
+  grepl("granulocyte", cell_type_info$cell_type, ignore.case = TRUE) ~ 31,
+
+  grepl("natural killer", cell_type_info$cell_type, ignore.case = TRUE) ~ 40,
+  grepl("innate lymphoid", cell_type_info$cell_type, ignore.case = TRUE) ~ 41,
+
+  grepl("erythroid", cell_type_info$cell_type, ignore.case = TRUE) ~ 50,
+  grepl("hematopoietic precursor", cell_type_info$cell_type, ignore.case = TRUE) ~ 60,
+
+  TRUE ~ 99
+)
+
+cell_type_info <- cell_type_info %>%
+  arrange(
+    cell_group,
+    cell_type_order,
+    cell_type
+  )
+
+cell_types_ordered <- cell_type_info$cell_type
+
+# Average expression by ordered detailed cell types
+
+avg_mat <- sapply(
+  cell_types_ordered,
+  function(ct) {
+
+    cols <- which(
+      thymus_heatmap_meta$cell_type == ct
+    )
+
+    Matrix::rowMeans(
+      expr_sub[
+        ,
+        cols,
+        drop = FALSE
+      ]
+    )
+  }
+)
+
+avg_mat <- as.matrix(avg_mat)
+
+label_df <- thymus_heatmap_meta %>%
+  group_by(cell_type) %>%
+  summarise(
+    d = n_distinct(donor_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[
+  match(
+    cell_types_ordered,
+    label_df$cell_type
+  ),
+]
+
+colnames(avg_mat) <- paste0(
+  label_df$cell_type,
+  " (d=",
+  label_df$d,
+  ", n=",
+  label_df$n,
+  ")"
+)
+
+legend_max <- as.numeric(
+  quantile(
+    avg_mat,
+    0.99,
+    na.rm = TRUE
+  )
+)
+
+col_fun <- colorRamp2(
+  c(
+    0,
+    legend_max / 2,
+    legend_max
+  ),
+  c(
+    "#2166AC",
+    "#D0D0D0",
+    "#B2182B"
+  )
+)
+
+ht <- Heatmap(
+  avg_mat,
+
+  name = "Mean expression\nlog(CPM/100 + 1)",
+
+  col = col_fun,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+
+  # Removed column_split so group labels do not show at the top
+
+  rect_gp = gpar(
+    col = "white",
+    lwd = 1
+  ),
+
+  row_names_gp = gpar(
+    fontsize = 12,
+    fontface = "bold"
+  ),
+  
+  row_names_side = "left",
+
+  column_names_side = "bottom",
+  column_names_rot = 90,
+
+  column_names_gp = gpar(
+    fontsize = 7
+  ),
+
+  width = unit(
+    38,
+    "cm"
+  ),
+
+  height = unit(
+    5,
+    "cm"
+  ),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+
+    val <- avg_mat[i, j]
+
+    lab <- if (val < 0.005) {
+      "0"
+    } else {
+      sprintf("%.3f", val)
+    }
+
+    grid.text(
+      lab,
+      x,
+      y,
+      gp = gpar(
+        fontsize = 6,
+        col = "black"
+      )
+    )
+  }
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+png(
+  "thymus_CD24_SIGLEC10_horizontal_grouped_celltype_heatmap.png",
+  width = 4200,
+  height = 1800,
+  res = 220
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+dev.off()
+```
+
+#### vertical, long
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# Clean memory first
+rm(list = setdiff(ls(), c("pbmc_ped_healthy_qc")))
+gc()
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+# Main expression matrix
+expr_mat <- assay(pbmc_ped_healthy_qc, "X")
+
+# Gene names
+gene_col <- intersect(
+  c("gene_name", "gene_symbol", "symbol", "feature_name"),
+  colnames(rowData(pbmc_ped_healthy_qc))
+)[1]
+
+if (is.na(gene_col)) stop("No gene name column found.")
+
+gene_names <- rowData(pbmc_ped_healthy_qc)[[gene_col]]
+
+# Metadata
+meta <- as.data.frame(colData(pbmc_ped_healthy_qc))
+
+# Keep valid cells
+keep_cells <- !is.na(meta$cell_type) & meta$cell_type != "" &
+              !is.na(meta$patient_id) & meta$patient_id != ""
+
+meta <- meta[keep_cells, , drop = FALSE]
+expr_mat <- expr_mat[, keep_cells, drop = FALSE]
+
+# Broad cell classes
+meta <- meta %>%
+  mutate(
+    cell_class = case_when(
+      grepl("T cell|regulatory T|gamma-delta T|mucosal invariant T|alpha-beta", cell_type, ignore.case = TRUE) ~ "T cell",
+      grepl("natural killer|NK", cell_type, ignore.case = TRUE) ~ "NK cell",
+      grepl("B cell|plasma|plasmablast", cell_type, ignore.case = TRUE) ~ "B / plasma",
+      grepl("monocyte|granulocyte", cell_type, ignore.case = TRUE) ~ "Myeloid",
+      grepl("dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("erythrocyte|platelet", cell_type, ignore.case = TRUE) ~ "Erythroid / platelet",
+      grepl("precursor", cell_type, ignore.case = TRUE) ~ "Progenitor",
+      TRUE ~ "Other"
+    )
+  )
+
+# Keep requested genes
+gene_idx <- match(genes_to_plot, gene_names)
+present <- !is.na(gene_idx)
+
+if (!any(present)) stop("None of the requested genes were found.")
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+# IMPORTANT:
+# Pull only these 2 genes into memory as a small dense matrix
+expr_sub <- as.matrix(expr_mat[gene_idx, , drop = FALSE])
+rownames(expr_sub) <- genes_present
+
+# Drop the huge backed matrix now
+rm(expr_mat)
+gc()
+
+cell_classes <- c(
+  "B / plasma",
+  "Dendritic",
+  "Erythroid / platelet",
+  "Myeloid",
+  "NK cell",
+  "Progenitor",
+  "T cell",
+  "Other"
+)
+cell_classes <- cell_classes[cell_classes %in% unique(meta$cell_class)]
+
+class_fac <- factor(meta$cell_class, levels = cell_classes)
+
+# Safe averaging: no large matrix slicing inside loops
+avg_mat <- t(sapply(seq_len(nrow(expr_sub)), function(i) {
+  out <- tapply(expr_sub[i, ], class_fac, mean, na.rm = TRUE)
+  out[cell_classes]
+}))
+
+avg_mat <- as.matrix(avg_mat)
+rownames(avg_mat) <- genes_present
+colnames(avg_mat) <- cell_classes
+
+# Rows = broad cell classes
+heatmap_mat <- t(avg_mat)
+heatmap_mat[is.na(heatmap_mat)] <- 0
+
+# Donor count (d) and cell count (n)
+label_df <- meta %>%
+  group_by(cell_class) %>%
+  summarise(
+    d = n_distinct(patient_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[match(rownames(heatmap_mat), label_df$cell_class), ]
+
+rownames(heatmap_mat) <- paste0(
+  label_df$cell_class,
+  " (d = ", label_df$d, ", n = ", label_df$n, ")"
+)
+
+legend_min <- 0
+legend_max <- as.numeric(quantile(heatmap_mat, probs = 0.99, na.rm = TRUE))
+legend_mid <- legend_max / 2
+
+col_fun <- colorRamp2(
+  c(legend_min, legend_mid, legend_max),
+  c("#2166AC", "#D0D0D0", "#B2182B")
+)
+
+legend_ticks <- pretty(c(legend_min, legend_max), n = 5)
+legend_ticks <- legend_ticks[legend_ticks >= legend_min & legend_ticks <= legend_max]
+
+ht <- Heatmap(
+  heatmap_mat,
+  name = "Mean expression\nlog(CPM/100 + 1)",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = NA),
+
+  width = unit(4.2, "cm"),
+  height = unit(12, "cm"),
+
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 16, fontface = "bold"),
+  row_names_max_width = unit(12, "cm"),
+  show_column_names = TRUE,
+  column_names_gp = gpar(fontsize = 16, fontface = "bold"),
+
+  heatmap_legend_param = list(
+    title = "Mean expression\nlog(CPM/100 + 1)\n",
+    title_position = "leftcenter-rot",
+    at = legend_ticks,
+    labels = round(legend_ticks, 2),
+    legend_height = unit(60, "mm"),
+    title_gp = gpar(fontsize = 14, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12, fontface = "bold")
+  ),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- heatmap_mat[i, j]
+    lab <- if (is.na(val) || val < 0.005) "0" else sprintf("%.2f", val)
+    grid.text(
+      lab,
+      x, y,
+      gp = gpar(fontsize = 13, fontface = "bold", col = "black")
+    )
+  }
+)
+
+png(
+  "pediatric_healthy_heatmap_broad_classes_quantile99_cd24_siglec10.png",
+  width = 3200,
+  height = 2400,
+  res = 300
+)
+draw(ht, heatmap_legend_side = "right")
+dev.off()
+```

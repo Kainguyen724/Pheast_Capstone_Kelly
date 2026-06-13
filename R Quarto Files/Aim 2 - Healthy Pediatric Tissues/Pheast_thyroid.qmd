@@ -1,0 +1,1077 @@
+---
+title: "pheast_thyroid"
+format: html
+editor: visual
+---
+
+## Loading In data set
+
+```{r}
+# Chunk 1: Check and extract files
+
+getwd()
+
+if (!dir.exists("GSE281736_RAW")) {
+  stop("GSE281736_RAW folder not found. Move it into your R Studio folder.")
+}
+
+list.files(
+  "GSE281736_RAW",
+  recursive = TRUE
+)
+```
+
+#### Filtering:
+
+```{r}
+# Chunk 1: Match GEO metadata to CAYA adjacent normal thyroid P files
+
+library(GEOquery)
+library(Seurat)
+library(dplyr)
+library(stringr)
+
+gse <- getGEO(
+  "GSE281736",
+  GSEMatrix = TRUE
+)
+
+thyroid_pheno <- pData(gse[[1]])
+
+# Keep only CAYA adjacent normal thyroid P samples
+thyroid_CAYA_P_samples <- thyroid_pheno[
+  thyroid_pheno$`tissue region:ch1` == "P" &
+    grepl("CAYA", thyroid_pheno$title),
+]
+
+thyroid_CAYA_P_samples[
+  ,
+  c(
+    "title",
+    "geo_accession",
+    "tissue region:ch1",
+    "tissue:ch1"
+  )
+]
+
+# These GSM accessions are the files to load
+thyroid_keep_gsm <- thyroid_CAYA_P_samples$geo_accession
+
+cat("CAYA P GSM samples to load:\n")
+print(thyroid_keep_gsm)
+
+cat("\nCAYA P sample titles:\n")
+print(thyroid_CAYA_P_samples$title)
+```
+
+```{r}
+# Chunk 2: Load CAYA adjacent normal thyroid P samples from MTX files
+
+library(Seurat)
+library(dplyr)
+library(stringr)
+
+raw_dir <- "GSE281736_RAW"
+
+thyroid_list <- list()
+
+for (gsm in thyroid_keep_gsm) {
+  
+  matrix_file <- list.files(
+    raw_dir,
+    pattern = paste0(gsm, ".*matrix\\.mtx\\.gz$"),
+    full.names = TRUE
+  )
+  
+  barcode_file <- list.files(
+    raw_dir,
+    pattern = paste0(gsm, ".*barcodes\\.tsv\\.gz$"),
+    full.names = TRUE
+  )
+  
+  gene_file <- list.files(
+    raw_dir,
+    pattern = paste0(gsm, ".*genes\\.tsv\\.gz$"),
+    full.names = TRUE
+  )
+  
+  if (
+    length(matrix_file) == 0 |
+    length(barcode_file) == 0 |
+    length(gene_file) == 0
+  ) {
+    cat("Missing files for:", gsm, "\n")
+    next
+  }
+  
+  sample_title <- thyroid_CAYA_P_samples$title[
+    thyroid_CAYA_P_samples$geo_accession == gsm
+  ]
+  
+  cat("Loading:", gsm, sample_title, "\n")
+  
+  counts <- ReadMtx(
+    mtx = matrix_file[1],
+    cells = barcode_file[1],
+    features = gene_file[1],
+    feature.column = 2
+  )
+  
+  thyroid_obj <- CreateSeuratObject(
+    counts = counts,
+    project = sample_title
+  )
+  
+  thyroid_obj$sample_id <- sample_title
+  thyroid_obj$geo_accession <- gsm
+  thyroid_obj$donor_id <- sample_title
+  thyroid_obj$tissue <- "thyroid"
+  thyroid_obj$tissue_region <- "P"
+  thyroid_obj$age_group <- "CAYA"
+  thyroid_obj$group <- "CAYA adjacent normal thyroid"
+  
+  thyroid_list[[sample_title]] <- thyroid_obj
+}
+
+thyroid_seurat <- merge(
+  thyroid_list[[1]],
+  y = thyroid_list[-1]
+)
+
+thyroid_seurat
+
+cat(
+  "Cells loaded:",
+  ncol(thyroid_seurat),
+  "\n"
+)
+
+cat(
+  "\nSamples loaded:\n"
+)
+
+print(
+  table(thyroid_seurat$sample_id)
+)
+
+cat(
+  "\nAge group:\n"
+)
+
+print(
+  table(thyroid_seurat$age_group)
+)
+
+cat(
+  "\nTissue region:\n"
+)
+
+print(
+  table(thyroid_seurat$tissue_region)
+)
+```
+
+```{r}
+# Filter to adjacent normal thyroid P samples from CAYA donors only
+
+thyroid_P_samples <- thyroid_pheno[
+  thyroid_pheno$`tissue region:ch1` == "P",
+]
+
+thyroid_P_CAYA_samples <- thyroid_P_samples[
+  grepl("CAYA", thyroid_P_samples$title),
+]
+
+cat("Adjacent normal thyroid P samples:\n")
+print(thyroid_P_samples$title)
+
+cat("\nCAYA adjacent normal thyroid P samples:\n")
+print(thyroid_P_CAYA_samples$title)
+
+cat("\nNumber of CAYA P samples:\n")
+print(nrow(thyroid_P_CAYA_samples))
+```
+
+#### QC:
+
+```{r}
+# Chunk 3: QC for CAYA adjacent normal thyroid dataset
+
+library(Seurat)
+library(dplyr)
+
+thyroid_seurat[["percent.mito"]] <- PercentageFeatureSet(
+  thyroid_seurat,
+  pattern = "^MT-"
+)
+
+thyroid_keep_cells <-
+  thyroid_seurat$nFeature_RNA >= 200 &
+  thyroid_seurat$nCount_RNA >= 500 &
+  thyroid_seurat$percent.mito <= 20
+
+thyroid_ped_normal_qc <- thyroid_seurat[
+  ,
+  thyroid_keep_cells
+]
+
+cat(
+  "Cell count before QC:",
+  ncol(thyroid_seurat),
+  "\n"
+)
+
+cat(
+  "Cell count after QC:",
+  ncol(thyroid_ped_normal_qc),
+  "\n"
+)
+
+cat(
+  "Cells removed during QC:",
+  ncol(thyroid_seurat) - ncol(thyroid_ped_normal_qc),
+  "\n"
+)
+
+cat(
+  "\nSamples after QC:\n"
+)
+
+print(
+  table(thyroid_ped_normal_qc$sample_id)
+)
+
+cat(
+  "\nNumber of CAYA P samples after QC:",
+  length(unique(thyroid_ped_normal_qc$sample_id)),
+  "\n"
+)
+```
+
+#### Normalization:
+
+```{r}
+# Check if thyroid data are raw counts, then normalize
+
+library(Seurat)
+
+# Check available layers
+cat("Current RNA layers:\n")
+print(
+  Layers(thyroid_ped_normal_qc[["RNA"]])
+)
+
+# Check raw count values from first layer
+first_count_layer <- Layers(thyroid_ped_normal_qc[["RNA"]])[1]
+
+cat("\nSummary of first count layer values:\n")
+print(
+  summary(
+    GetAssayData(
+      thyroid_ped_normal_qc,
+      layer = first_count_layer
+    )@x
+  )
+)
+
+cat("\nInterpretation:\n")
+cat("Only counts layers are present, so this dataset is raw counts only.\n")
+
+# Normalize raw counts
+thyroid_ped_normal_qc <- NormalizeData(
+  thyroid_ped_normal_qc,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000
+)
+
+cat("\nNormalization complete.\n")
+cat("Normalization method: log1p(counts per 10k)\n")
+
+# Check new layers
+cat("\nRNA layers after normalization:\n")
+print(
+  Layers(thyroid_ped_normal_qc[["RNA"]])
+)
+```
+
+#### Heatmaps: NO IN-DEPTH CELL TYPE LABELS IN THIS DATASET
+
+#### Broad:
+
+```{r}
+# Broad Cell Type Heatmap
+# CAYA adjacent normal thyroid
+# Uses cell_type labels
+
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+# Marker genes for thyroid cell-type labeling
+thyroid_marker_genes <- c(
+  genes_to_plot,
+  "TG", "TPO", "SLC5A5", "TSHR", "EPCAM", "KRT8", "KRT18",
+  "PECAM1", "VWF", "KDR", "CLDN5",
+  "COL1A1", "COL1A2", "DCN", "LUM", "COL3A1",
+  "LYZ", "LST1", "S100A8", "S100A9", "CD14", "FCGR3A",
+  "CD3D", "CD3E", "TRAC",
+  "MS4A1", "CD79A", "CD79B",
+  "NKG7", "GNLY", "KLRD1"
+)
+
+thyroid_marker_genes <- unique(thyroid_marker_genes)
+
+# Use normalized data layers
+data_layers <- grep(
+  "^data",
+  Layers(thyroid_ped_normal_qc[["RNA"]]),
+  value = TRUE
+)
+
+if (length(data_layers) == 0) {
+  stop("No normalized data layers found. Run NormalizeData() first.")
+}
+
+expr_list <- lapply(
+  data_layers,
+  function(layer_name) {
+    
+    mat <- GetAssayData(
+      thyroid_ped_normal_qc,
+      layer = layer_name
+    )
+    
+    out <- Matrix(
+      0,
+      nrow = length(thyroid_marker_genes),
+      ncol = ncol(mat),
+      sparse = TRUE
+    )
+    
+    rownames(out) <- thyroid_marker_genes
+    colnames(out) <- colnames(mat)
+    
+    present <- intersect(
+      thyroid_marker_genes,
+      rownames(mat)
+    )
+    
+    if (length(present) > 0) {
+      out[present, ] <- mat[present, , drop = FALSE]
+    }
+    
+    out
+  }
+)
+
+thyroid_expr_marker <- do.call(
+  cbind,
+  expr_list
+)
+
+thyroid_expr_marker <- as(
+  thyroid_expr_marker,
+  "dgCMatrix"
+)
+
+meta <- thyroid_ped_normal_qc@meta.data
+
+meta <- meta[
+  colnames(thyroid_expr_marker),
+  ,
+  drop = FALSE
+]
+
+marker_score <- function(genes) {
+  
+  present <- intersect(
+    genes,
+    rownames(thyroid_expr_marker)
+  )
+  
+  if (length(present) == 0) {
+    return(rep(0, ncol(thyroid_expr_marker)))
+  }
+  
+  Matrix::colMeans(
+    thyroid_expr_marker[present, , drop = FALSE]
+  )
+}
+
+scores <- data.frame(
+  Thyrocytes = marker_score(c("TG", "TPO", "SLC5A5", "TSHR", "EPCAM", "KRT8", "KRT18")),
+  Endothelial_cells = marker_score(c("PECAM1", "VWF", "KDR", "CLDN5")),
+  Fibroblasts = marker_score(c("COL1A1", "COL1A2", "DCN", "LUM", "COL3A1")),
+  Myeloid_cells = marker_score(c("LYZ", "LST1", "S100A8", "S100A9", "CD14", "FCGR3A")),
+  T_cells = marker_score(c("CD3D", "CD3E", "TRAC")),
+  B_cells = marker_score(c("MS4A1", "CD79A", "CD79B")),
+  NK_cells = marker_score(c("NKG7", "GNLY", "KLRD1")),
+  check.names = FALSE
+)
+
+max_score <- apply(
+  scores,
+  1,
+  max,
+  na.rm = TRUE
+)
+
+cell_type <- colnames(scores)[
+  max.col(scores, ties.method = "first")
+]
+
+cell_type[max_score < 0.05] <- "Other"
+cell_type <- gsub("_", " ", cell_type)
+
+meta$cell_type <- cell_type
+
+expr_hm <- thyroid_expr_marker[
+  genes_to_plot,
+  ,
+  drop = FALSE
+]
+
+keep_valid <- !is.na(meta$cell_type) &
+              meta$cell_type != ""
+
+meta <- meta[
+  keep_valid,
+  ,
+  drop = FALSE
+]
+
+expr_hm <- expr_hm[
+  ,
+  keep_valid,
+  drop = FALSE
+]
+
+cell_type_order <- c(
+  "Thyrocytes",
+  "Endothelial cells",
+  "Fibroblasts",
+  "Myeloid cells",
+  "T cells",
+  "B cells",
+  "NK cells",
+  "Other"
+)
+
+cell_types <- cell_type_order[
+  cell_type_order %in% unique(meta$cell_type)
+]
+
+avg_mat <- sapply(
+  cell_types,
+  function(ct) {
+    
+    cols <- which(meta$cell_type == ct)
+    
+    Matrix::rowMeans(
+      expr_hm[, cols, drop = FALSE]
+    )
+  }
+)
+
+avg_mat <- as.matrix(avg_mat)
+
+heatmap_mat <- t(avg_mat)
+
+label_df <- meta %>%
+  group_by(cell_type) %>%
+  summarise(
+    d = n_distinct(donor_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[
+  match(rownames(heatmap_mat), label_df$cell_type),
+]
+
+rownames(heatmap_mat) <- paste0(
+  label_df$cell_type,
+  " (d=",
+  label_df$d,
+  ", n=",
+  label_df$n,
+  ")"
+)
+
+legend_max <- as.numeric(
+  quantile(heatmap_mat, probs = 0.99, na.rm = TRUE)
+)
+
+col_fun <- colorRamp2(
+  c(0, legend_max / 2, legend_max),
+  c("#2166AC", "#D0D0D0", "#B2182B")
+)
+
+ht <- Heatmap(
+  heatmap_mat,
+  name = "Mean expression\nlog(CPM/100 + 1)",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = "white", lwd = 1),
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 14, fontface = "bold"),
+  row_names_max_width = unit(12, "cm"),
+  column_names_gp = gpar(fontsize = 16, fontface = "bold"),
+  column_names_rot = 45,
+
+  heatmap_legend_param = list(
+    title_gp = gpar(fontsize = 14, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12)
+  ),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    
+    val <- heatmap_mat[i, j]
+    lab <- if (val < 0.005) "0" else sprintf("%.4f", val)
+    
+    grid.text(
+      lab,
+      x,
+      y,
+      gp = gpar(fontsize = 10, col = "black")
+    )
+  }
+)
+
+grid.newpage()
+draw(ht, heatmap_legend_side = "right")
+
+png(
+  "thyroid_CD24_SIGLEC10_broad_heatmap_presentation.png",
+  width = 3000,
+  height = 3200,
+  res = 300
+)
+
+grid.newpage()
+draw(ht, heatmap_legend_side = "right")
+dev.off()
+```
+
+#### Horizontal:
+
+```{r}
+# Check if active identities have any labels
+
+# Check active identity levels
+levels(Idents(thyroid_seurat))
+
+# Count identities
+table(Idents(thyroid_seurat))
+
+# Check if identities equal sample IDs
+table(
+  Idents(thyroid_seurat),
+  thyroid_seurat$sample_id
+)
+```
+
+```{r}
+
+# Horizontal Long Heatmap
+# CAYA adjacent normal thyroid
+# Detailed marker-derived cell labels grouped by broad lineage
+
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+# -------------------------
+# Marker genes
+# -------------------------
+
+thyroid_marker_genes <- c(
+  genes_to_plot,
+
+  # Thyroid epithelial
+  "TG", "TPO", "SLC5A5", "TSHR", "EPCAM", "KRT8", "KRT18",
+  "MKI67", "TOP2A",
+
+  # Stromal / vascular
+  "PECAM1", "VWF", "KDR", "CLDN5",
+  "COL1A1", "COL1A2", "DCN", "LUM", "COL3A1",
+  "ACTA2", "TAGLN", "RGS5", "PDGFRB",
+
+  # Myeloid / dendritic
+  "LYZ", "LST1", "S100A8", "S100A9", "CD14", "FCGR3A",
+  "C1QA", "C1QB", "C1QC",
+  "FCER1A", "CLEC10A", "IL3RA", "CLEC4C",
+
+  # T / NK
+  "CD3D", "CD3E", "TRAC",
+  "CD4", "IL7R",
+  "CD8A", "CD8B",
+  "FOXP3", "IL2RA", "CTLA4",
+  "NKG7", "GNLY", "KLRD1", "PRF1",
+
+  # B / plasma
+  "MS4A1", "CD79A", "CD79B", "CD74", "TCL1A", "IGHD",
+  "MZB1", "XBP1", "JCHAIN", "IGKC"
+)
+
+thyroid_marker_genes <- unique(thyroid_marker_genes)
+
+# -------------------------
+# Pull normalized data layers
+# -------------------------
+
+data_layers <- grep(
+  "^data",
+  Layers(thyroid_ped_normal_qc[["RNA"]]),
+  value = TRUE
+)
+
+if (length(data_layers) == 0) {
+  stop("No normalized data layers found. Run NormalizeData() first.")
+}
+
+expr_list <- lapply(
+  data_layers,
+  function(layer_name) {
+
+    mat <- GetAssayData(
+      thyroid_ped_normal_qc,
+      layer = layer_name
+    )
+
+    out <- Matrix(
+      0,
+      nrow = length(thyroid_marker_genes),
+      ncol = ncol(mat),
+      sparse = TRUE
+    )
+
+    rownames(out) <- thyroid_marker_genes
+    colnames(out) <- colnames(mat)
+
+    present <- intersect(
+      thyroid_marker_genes,
+      rownames(mat)
+    )
+
+    if (length(present) > 0) {
+      out[present, ] <- mat[present, , drop = FALSE]
+    }
+
+    out
+  }
+)
+
+thyroid_expr_marker <- do.call(
+  cbind,
+  expr_list
+)
+
+thyroid_expr_marker <- as(
+  thyroid_expr_marker,
+  "dgCMatrix"
+)
+
+# -------------------------
+# Metadata
+# -------------------------
+
+thyroid_heatmap_meta <- thyroid_ped_normal_qc@meta.data
+
+thyroid_heatmap_meta <- thyroid_heatmap_meta[
+  colnames(thyroid_expr_marker),
+  ,
+  drop = FALSE
+]
+
+# -------------------------
+# Marker scoring
+# -------------------------
+
+marker_score <- function(genes) {
+
+  present <- intersect(
+    genes,
+    rownames(thyroid_expr_marker)
+  )
+
+  if (length(present) == 0) {
+    return(rep(0, ncol(thyroid_expr_marker)))
+  }
+
+  Matrix::colMeans(
+    thyroid_expr_marker[present, , drop = FALSE]
+  )
+}
+
+scores <- data.frame(
+  Thyrocytes = marker_score(c(
+    "TG", "TPO", "SLC5A5", "TSHR", "EPCAM", "KRT8", "KRT18"
+  )),
+
+  Proliferating_thyrocytes = marker_score(c(
+    "MKI67", "TOP2A", "EPCAM", "KRT8", "KRT18"
+  )),
+
+  Endothelial_cells = marker_score(c(
+    "PECAM1", "VWF", "KDR", "CLDN5"
+  )),
+
+  Fibroblasts = marker_score(c(
+    "COL1A1", "COL1A2", "DCN", "LUM", "COL3A1"
+  )),
+
+  Pericytes_smooth_muscle = marker_score(c(
+    "ACTA2", "TAGLN", "RGS5", "PDGFRB"
+  )),
+
+  Monocytes = marker_score(c(
+    "LYZ", "LST1", "S100A8", "S100A9", "CD14"
+  )),
+
+  Macrophages = marker_score(c(
+    "C1QA", "C1QB", "C1QC", "LYZ"
+  )),
+
+  Dendritic_cells = marker_score(c(
+    "FCER1A", "CLEC10A"
+  )),
+
+  Plasmacytoid_dendritic_cells = marker_score(c(
+    "IL3RA", "CLEC4C"
+  )),
+
+  CD4_T_cells = marker_score(c(
+    "CD3D", "CD3E", "TRAC", "CD4", "IL7R"
+  )),
+
+  CD8_T_cells = marker_score(c(
+    "CD3D", "CD3E", "TRAC", "CD8A", "CD8B"
+  )),
+
+  Regulatory_T_cells = marker_score(c(
+    "FOXP3", "IL2RA", "CTLA4", "CD3D"
+  )),
+
+  NK_cells = marker_score(c(
+    "NKG7", "GNLY", "KLRD1", "PRF1"
+  )),
+
+  Naive_B_cells = marker_score(c(
+    "MS4A1", "CD79A", "CD79B", "CD74", "TCL1A", "IGHD"
+  )),
+
+  Plasma_cells = marker_score(c(
+    "MZB1", "XBP1", "JCHAIN", "IGKC"
+  )),
+
+  check.names = FALSE
+)
+
+max_score <- apply(
+  scores,
+  1,
+  max,
+  na.rm = TRUE
+)
+
+thyroid_cell_type <- colnames(scores)[
+  max.col(scores, ties.method = "first")
+]
+
+thyroid_cell_type[
+  max_score < 0.05
+] <- "Other"
+
+thyroid_cell_type <- gsub(
+  "_",
+  " ",
+  thyroid_cell_type
+)
+
+thyroid_heatmap_meta$cell_type <- thyroid_cell_type
+
+cat("Detailed thyroid cell type counts:\n")
+print(
+  sort(
+    table(thyroid_heatmap_meta$cell_type),
+    decreasing = TRUE
+  )
+)
+
+# -------------------------
+# CD24 / SIGLEC10 expression
+# -------------------------
+
+expr_hm <- thyroid_expr_marker[
+  genes_to_plot,
+  ,
+  drop = FALSE
+]
+
+keep_valid <- !is.na(thyroid_heatmap_meta$cell_type) &
+              thyroid_heatmap_meta$cell_type != ""
+
+thyroid_heatmap_meta <- thyroid_heatmap_meta[
+  keep_valid,
+  ,
+  drop = FALSE
+]
+
+expr_hm <- expr_hm[
+  ,
+  keep_valid,
+  drop = FALSE
+]
+
+# -------------------------
+# Group detailed cell labels like blood heatmap
+# -------------------------
+
+cell_types <- unique(
+  thyroid_heatmap_meta$cell_type
+)
+
+cell_type_info <- data.frame(
+  cell_type = cell_types,
+  stringsAsFactors = FALSE
+)
+
+cell_type_info$cell_group <- case_when(
+  grepl(
+    "Thyrocyte",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Thyroid epithelial",
+
+  grepl(
+    "Endothelial|Fibroblast|Pericyte|smooth muscle",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Stromal / vascular",
+
+  grepl(
+    "Monocyte|Macrophage|Dendritic",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Myeloid / dendritic",
+
+  grepl(
+    "CD4|CD8|Regulatory T",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "T cells",
+
+  grepl(
+    "NK",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "NK cells",
+
+  grepl(
+    "B cell|Plasma",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "B lineage",
+
+  TRUE ~ "Other"
+)
+
+group_order <- c(
+  "Thyroid epithelial",
+  "Stromal / vascular",
+  "Myeloid / dendritic",
+  "T cells",
+  "NK cells",
+  "B lineage",
+  "Other"
+)
+
+cell_type_info$cell_group <- factor(
+  cell_type_info$cell_group,
+  levels = group_order
+)
+
+cell_type_info <- cell_type_info %>%
+  arrange(
+    cell_group,
+    cell_type
+  )
+
+cell_types_ordered <- cell_type_info$cell_type
+
+# -------------------------
+# Average expression by ordered cell types
+# -------------------------
+
+avg_mat <- sapply(
+  cell_types_ordered,
+  function(ct) {
+
+    cols <- which(
+      thyroid_heatmap_meta$cell_type == ct
+    )
+
+    Matrix::rowMeans(
+      expr_hm[
+        ,
+        cols,
+        drop = FALSE
+      ]
+    )
+  }
+)
+
+avg_mat <- as.matrix(avg_mat)
+
+label_df <- thyroid_heatmap_meta %>%
+  group_by(cell_type) %>%
+  summarise(
+    d = n_distinct(donor_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[
+  match(
+    cell_types_ordered,
+    label_df$cell_type
+  ),
+]
+
+colnames(avg_mat) <- paste0(
+  label_df$cell_type,
+  " (d=",
+  label_df$d,
+  ", n=",
+  label_df$n,
+  ")"
+)
+
+# -------------------------
+# Color scale
+# -------------------------
+
+legend_max <- as.numeric(
+  quantile(
+    avg_mat,
+    probs = 0.99,
+    na.rm = TRUE
+  )
+)
+
+col_fun <- colorRamp2(
+  c(
+    0,
+    legend_max / 2,
+    legend_max
+  ),
+  c(
+    "#2166AC",
+    "#D0D0D0",
+    "#B2182B"
+  )
+)
+
+# -------------------------
+# Heatmap
+# -------------------------
+
+ht <- Heatmap(
+  avg_mat,
+
+  name = "Mean expression\nlog1p(counts per 10k)",
+
+  col = col_fun,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+
+  column_split = cell_type_info$cell_group,
+
+  rect_gp = gpar(
+    col = "white",
+    lwd = 1
+  ),
+
+  row_names_gp = gpar(
+    fontsize = 12,
+    fontface = "bold"
+  ),
+
+  column_names_side = "bottom",
+  column_names_rot = 90,
+
+  column_names_gp = gpar(
+    fontsize = 7
+  ),
+
+  width = unit(
+    42,
+    "cm"
+  ),
+
+  height = unit(
+    5,
+    "cm"
+  ),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+
+    val <- avg_mat[i, j]
+
+    lab <- if (val < 0.005) {
+      "0"
+    } else {
+      sprintf("%.3f", val)
+    }
+
+    grid.text(
+      lab,
+      x,
+      y,
+      gp = gpar(
+        fontsize = 6,
+        col = "black"
+      )
+    )
+  }
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+png(
+  "thyroid_CD24_SIGLEC10_horizontal_detailed_grouped_heatmap.png",
+  width = 4600,
+  height = 1800,
+  res = 220
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+dev.off()
+```
+
+```         
+```

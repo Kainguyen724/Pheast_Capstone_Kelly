@@ -1,0 +1,1363 @@
+---
+title: "Pheast_brain"
+format: html
+editor: visual
+---
+
+## Loading in Dataset
+
+```{r}
+# Load dataset
+
+library(zellkonverter)
+
+brain_sce <- readH5AD(
+  "09971952-46c4-410c-8fb1-0afa7b0b225f.h5ad",
+  use_hdf5 = TRUE
+)
+```
+
+```{r}
+library(SingleCellExperiment)
+# Basic object info
+brain_sce
+
+# Dimensions
+dim(brain_sce)
+
+# Assays
+assayNames(brain_sce)
+
+# Metadata column names
+colnames(colData(brain_sce))
+
+# Small metadata preview
+as.data.frame(
+  colData(brain_sce)[1:5, 1:10]
+)
+
+# Search for age/development columns
+cat("\nPossible age/development columns:\n")
+
+grep(
+  "age|development|stage",
+  colnames(colData(brain_sce)),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+# Search for disease/health columns
+cat("\nPossible disease/health columns:\n")
+
+grep(
+  "disease|health|normal",
+  colnames(colData(brain_sce)),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+# Search for tissue/organ columns
+cat("\nPossible tissue/organ columns:\n")
+
+grep(
+  "tissue|organ|brain",
+  colnames(colData(brain_sce)),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+# Search for cell annotation columns
+cat("\nPossible cell annotation columns:\n")
+
+grep(
+  "cell|type|annot|cluster|class|subclass",
+  colnames(colData(brain_sce)),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+# Search for donor/sample columns
+cat("\nPossible donor/sample columns:\n")
+
+grep(
+  "donor|sample|patient|individual",
+  colnames(colData(brain_sce)),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+# Gene metadata columns
+cat("\nGene metadata columns:\n")
+
+colnames(rowData(brain_sce))
+
+# Small gene metadata preview
+as.data.frame(
+  rowData(brain_sce)[1:5, ]
+)
+
+# Preview gene rownames
+head(rownames(brain_sce))
+```
+
+### QC:
+
+```{r}
+# =========================
+# Brain dataset filter + QC
+# =========================
+
+library(SingleCellExperiment)
+library(scuttle)
+library(Matrix)
+library(dplyr)
+
+# Brain dataset is already pediatric + normal based on metadata
+brain_ped_healthy <- brain_sce
+
+cat(
+  "Cell count before QC:",
+  ncol(brain_ped_healthy),
+  "\n"
+)
+
+cat(
+  "Number of donors:",
+  length(unique(colData(brain_ped_healthy)$donor_id)),
+  "\n"
+)
+
+cat("\nAges of donors:\n")
+print(table(colData(brain_ped_healthy)$development_stage))
+
+cat("\nDisease labels:\n")
+print(table(colData(brain_ped_healthy)$disease))
+
+# Gene names
+brain_gene_names <- rownames(brain_ped_healthy)
+
+# Mitochondrial genes
+brain_is_mito <- grepl(
+  "^MT-",
+  brain_gene_names
+)
+
+# Ribosomal genes
+brain_is_ribo <- grepl(
+  "^RPL|^RPS",
+  brain_gene_names
+)
+
+# Add QC metrics
+brain_ped_healthy <- addPerCellQCMetrics(
+  brain_ped_healthy,
+  subsets = list(
+    Mito = brain_is_mito,
+    Ribo = brain_is_ribo
+  ),
+  assay.type = "X"
+)
+
+brain_qc_meta <- as.data.frame(
+  colData(brain_ped_healthy)
+)
+
+# QC filters
+brain_keep_qc <- brain_qc_meta$detected >= 200 &
+                 brain_qc_meta$subsets_Mito_percent <= 20
+
+brain_ped_healthy_qc <- brain_ped_healthy[
+  ,
+  brain_keep_qc
+]
+
+cat(
+  "\nCell count after QC:",
+  ncol(brain_ped_healthy_qc),
+  "\n"
+)
+
+cat(
+  "Cells removed during QC:",
+  ncol(brain_ped_healthy) - ncol(brain_ped_healthy_qc),
+  "\n"
+)
+
+cat("\nCell types after QC:\n")
+print(
+  sort(
+    table(colData(brain_ped_healthy_qc)$cell_type),
+    decreasing = TRUE
+  )
+)
+
+
+```
+
+```{r}
+# =========================
+# Brain dataset: check raw vs normalized, then normalize if needed
+# =========================
+
+library(SingleCellExperiment)
+library(scuttle)
+library(Matrix)
+library(DelayedArray)
+
+brain_expr <- assay(
+  brain_ped_healthy_qc,
+  "X"
+)
+
+cat("Brain assay used: X\n")
+cat("Expression matrix dimensions:\n")
+print(dim(brain_expr))
+
+# Sample a small part instead of pulling whole matrix into memory
+set.seed(123)
+
+brain_sample_values <- as.vector(
+  as.matrix(
+    brain_expr[
+      sample(seq_len(nrow(brain_expr)), min(500, nrow(brain_expr))),
+      sample(seq_len(ncol(brain_expr)), min(500, ncol(brain_expr)))
+    ]
+  )
+)
+
+brain_sample_values <- brain_sample_values[
+  !is.na(brain_sample_values)
+]
+
+brain_nonzero_values <- brain_sample_values[
+  brain_sample_values > 0
+]
+
+cat("\nSummary of sampled nonzero values:\n")
+print(summary(brain_nonzero_values))
+
+cat("\nAre sampled nonzero values integers?\n")
+
+brain_all_integer <- all(
+  abs(brain_nonzero_values - round(brain_nonzero_values)) < 1e-8
+)
+
+print(brain_all_integer)
+
+if (brain_all_integer) {
+  
+  cat("\nInterpretation: brain X looks like raw counts.\n")
+  cat("Normalizing with logNormCounts().\n")
+  
+  brain_ped_healthy_qc <- logNormCounts(
+    brain_ped_healthy_qc,
+    assay.type = "X",
+    name = "logcounts"
+  )
+  
+  brain_assay_to_use <- "logcounts"
+  
+} else {
+  
+  cat("\nInterpretation: brain X already looks normalized/log-transformed.\n")
+  cat("Using X directly for heatmaps.\n")
+  
+  brain_assay_to_use <- "X"
+}
+
+cat("\nAssays now available:\n")
+print(assayNames(brain_ped_healthy_qc))
+
+cat("\nAssay selected for brain heatmaps:\n")
+print(brain_assay_to_use)
+```
+
+### HeatMaps:
+
+#### Broad:
+
+```{r}
+# Broad Cell Type Heatmap
+
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+expr_mat <- assay(
+  brain_ped_healthy_qc,
+  "X"
+)
+
+# Gene names
+gene_col <- intersect(
+  c(
+    "gene_name",
+    "gene_symbol",
+    "symbol",
+    "feature_name"
+  ),
+  colnames(
+    rowData(brain_ped_healthy_qc)
+  )
+)[1]
+
+if (is.na(gene_col)) {
+
+  gene_names <- rownames(
+    brain_ped_healthy_qc
+  )
+
+} else {
+
+  gene_names <- as.character(
+    rowData(
+      brain_ped_healthy_qc
+    )[[gene_col]]
+  )
+}
+
+meta <- as.data.frame(
+  colData(
+    brain_ped_healthy_qc
+  )
+)
+
+keep_cells <- !is.na(meta$cell_type) &
+              meta$cell_type != "" &
+              !is.na(meta$donor_id)
+
+meta <- meta[
+  keep_cells,
+  ,
+  drop = FALSE
+]
+
+expr_mat <- expr_mat[
+  ,
+  keep_cells,
+  drop = FALSE
+]
+
+# Broad brain cell classes
+meta <- meta %>%
+  mutate(
+    broad_class = case_when(
+
+      grepl(
+        "excitatory|glutamatergic|projection",
+        cell_type,
+        ignore.case = TRUE
+      ) ~ "Excitatory neuron",
+
+      grepl(
+        "inhibitory|gabaergic|interneuron",
+        cell_type,
+        ignore.case = TRUE
+      ) ~ "Inhibitory neuron",
+
+      grepl(
+        "astrocyte",
+        cell_type,
+        ignore.case = TRUE
+      ) ~ "Astrocyte",
+
+      grepl(
+        "oligodendrocyte",
+        cell_type,
+        ignore.case = TRUE
+      ) ~ "Oligodendrocyte",
+
+      grepl(
+        "OPC",
+        cell_type,
+        ignore.case = TRUE
+      ) ~ "OPC",
+
+      grepl(
+        "microglia|macrophage",
+        cell_type,
+        ignore.case = TRUE
+      ) ~ "Microglia",
+
+      grepl(
+        "endothelial",
+        cell_type,
+        ignore.case = TRUE
+      ) ~ "Endothelial",
+
+      TRUE ~ "Other"
+    )
+  )
+
+gene_idx <- match(
+  genes_to_plot,
+  gene_names
+)
+
+present <- !is.na(gene_idx)
+
+genes_present <- genes_to_plot[present]
+
+gene_idx <- gene_idx[present]
+
+expr_sub <- expr_mat[
+  gene_idx,
+  ,
+  drop = FALSE
+]
+
+rownames(expr_sub) <- genes_present
+
+broad_classes <- unique(
+  meta$broad_class
+)
+
+avg_mat <- sapply(
+  broad_classes,
+  function(ct) {
+
+    cols <- which(
+      meta$broad_class == ct
+    )
+
+    Matrix::rowMeans(
+      expr_sub[, cols, drop = FALSE]
+    )
+  }
+)
+
+avg_mat <- as.matrix(avg_mat)
+
+heatmap_mat <- t(avg_mat)
+
+label_df <- meta %>%
+  group_by(broad_class) %>%
+  summarise(
+    d = n_distinct(donor_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[
+  match(
+    rownames(heatmap_mat),
+    label_df$broad_class
+  ),
+]
+
+rownames(heatmap_mat) <- paste0(
+  label_df$broad_class,
+  " (d=",
+  label_df$d,
+  ", n=",
+  label_df$n,
+  ")"
+)
+
+legend_max <- quantile(
+  heatmap_mat,
+  0.99,
+  na.rm = TRUE
+)
+
+col_fun <- colorRamp2(
+  c(
+    0,
+    legend_max/2,
+    legend_max
+  ),
+  c(
+    "#2166AC",
+    "#D0D0D0",
+    "#B2182B"
+  )
+)
+
+ht <- Heatmap(
+  heatmap_mat,
+
+  name = "Mean expression\nlog(CPM/100 + 1)",
+
+  col = col_fun,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+
+  row_names_side = "left",
+
+  rect_gp = gpar(
+    col = "white"
+  ),
+
+  row_names_gp = gpar(
+    fontsize = 10
+  ),
+
+  column_names_gp = gpar(
+    fontsize = 12,
+    fontface = "bold"
+  ),
+  
+  column_names_rot = 45,
+
+  cell_fun = function(
+    j, i, x, y,
+    width, height,
+    fill
+  ) {
+
+    val <- heatmap_mat[i, j]
+
+    grid.text(
+      sprintf("%.4f", val),
+      x,
+      y,
+      gp = gpar(fontsize = 8)
+    )
+  }
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+png(
+  "brain_CD24_SIGLEC10_broad.png",
+  width = 2400,
+  height = 2600,
+  res = 220
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+dev.off()
+```
+
+#### Horizontal Long:
+
+```{r}
+# Horizontal Long Heatmap
+# Brain detailed cell types ordered by broad lineage
+# No category titles shown
+# Presentation version: bigger bold text + higher resolution
+
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c(
+  "CD24",
+  "SIGLEC10"
+)
+
+expr_mat <- assay(
+  brain_ped_healthy_qc,
+  "X"
+)
+
+gene_col <- intersect(
+  c(
+    "gene_name",
+    "gene_symbol",
+    "symbol",
+    "feature_name"
+  ),
+  colnames(
+    rowData(
+      brain_ped_healthy_qc
+    )
+  )
+)[1]
+
+if (is.na(gene_col)) {
+  
+  gene_names <- rownames(
+    brain_ped_healthy_qc
+  )
+  
+} else {
+  
+  gene_names <- as.character(
+    rowData(
+      brain_ped_healthy_qc
+    )[[gene_col]]
+  )
+}
+
+brain_horizontal_meta <- as.data.frame(
+  colData(
+    brain_ped_healthy_qc
+  )
+)
+
+keep_cells <- !is.na(brain_horizontal_meta$cell_type) &
+              brain_horizontal_meta$cell_type != "" &
+              !is.na(brain_horizontal_meta$donor_id)
+
+brain_horizontal_meta <- brain_horizontal_meta[
+  keep_cells,
+  ,
+  drop = FALSE
+]
+
+expr_mat <- expr_mat[
+  ,
+  keep_cells,
+  drop = FALSE
+]
+
+gene_idx <- match(
+  genes_to_plot,
+  gene_names
+)
+
+present <- !is.na(gene_idx)
+
+if (!any(present)) {
+  stop("Requested genes not found.")
+}
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+expr_sub <- expr_mat[
+  gene_idx,
+  ,
+  drop = FALSE
+]
+
+rownames(expr_sub) <- genes_present
+
+# ------------------------------------
+# Order detailed brain cell types by broad lineage
+# No category headers shown
+# ------------------------------------
+
+cell_types <- unique(
+  brain_horizontal_meta$cell_type
+)
+
+cell_type_info <- data.frame(
+  cell_type = cell_types,
+  stringsAsFactors = FALSE
+)
+
+cell_type_info$cell_group <- case_when(
+  grepl(
+    "glutamatergic|GABAergic|neuron|neuronal|interneuron|excitatory|inhibitory|CA1|CA2|CA3|dentate|granule",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Neurons",
+  
+  grepl(
+    "astrocyte",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Astrocytes",
+  
+  grepl(
+    "oligodendrocyte precursor|OPC|precursor",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Oligodendrocyte lineage",
+  
+  grepl(
+    "oligodendrocyte",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Oligodendrocyte lineage",
+  
+  grepl(
+    "microglia|macrophage|monocyte|myeloid",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Microglia / myeloid",
+  
+  grepl(
+    "endothelial|vascular|capillary|arterial|venous",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Vascular",
+  
+  grepl(
+    "pericyte|smooth muscle|mural",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Vascular",
+  
+  grepl(
+    "ependymal|choroid",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Ependymal / choroid",
+  
+  grepl(
+    "T cell|B cell|NK cell|lymphocyte|immune",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Immune",
+  
+  TRUE ~ "Other"
+)
+
+group_order <- c(
+  "Neurons",
+  "Astrocytes",
+  "Oligodendrocyte lineage",
+  "Microglia / myeloid",
+  "Vascular",
+  "Ependymal / choroid",
+  "Immune",
+  "Other"
+)
+
+cell_type_info$cell_group <- factor(
+  cell_type_info$cell_group,
+  levels = group_order
+)
+
+# More specific ordering inside each group
+cell_type_info$cell_type_order <- case_when(
+  grepl("GABAergic|inhibitory|interneuron", cell_type_info$cell_type, ignore.case = TRUE) ~ 1,
+  grepl("glutamatergic|excitatory", cell_type_info$cell_type, ignore.case = TRUE) ~ 2,
+  grepl("CA1|CA2|CA3", cell_type_info$cell_type, ignore.case = TRUE) ~ 3,
+  grepl("dentate|granule", cell_type_info$cell_type, ignore.case = TRUE) ~ 4,
+  grepl("neuron", cell_type_info$cell_type, ignore.case = TRUE) ~ 5,
+  
+  grepl("astrocyte", cell_type_info$cell_type, ignore.case = TRUE) ~ 10,
+  
+  grepl("oligodendrocyte precursor|OPC", cell_type_info$cell_type, ignore.case = TRUE) ~ 20,
+  grepl("oligodendrocyte", cell_type_info$cell_type, ignore.case = TRUE) ~ 21,
+  
+  grepl("microglia", cell_type_info$cell_type, ignore.case = TRUE) ~ 30,
+  grepl("macrophage|monocyte|myeloid", cell_type_info$cell_type, ignore.case = TRUE) ~ 31,
+  
+  grepl("endothelial|capillary", cell_type_info$cell_type, ignore.case = TRUE) ~ 40,
+  grepl("pericyte|smooth muscle|mural", cell_type_info$cell_type, ignore.case = TRUE) ~ 41,
+  
+  grepl("ependymal", cell_type_info$cell_type, ignore.case = TRUE) ~ 50,
+  grepl("choroid", cell_type_info$cell_type, ignore.case = TRUE) ~ 51,
+  
+  grepl("T cell", cell_type_info$cell_type, ignore.case = TRUE) ~ 60,
+  grepl("B cell", cell_type_info$cell_type, ignore.case = TRUE) ~ 61,
+  grepl("NK cell", cell_type_info$cell_type, ignore.case = TRUE) ~ 62,
+  
+  TRUE ~ 99
+)
+
+cell_type_info <- cell_type_info %>%
+  arrange(
+    cell_group,
+    cell_type_order,
+    cell_type
+  )
+
+cell_types_ordered <- cell_type_info$cell_type
+
+# Average expression by ordered cell type
+
+avg_mat <- sapply(
+  cell_types_ordered,
+  function(ct) {
+    
+    cols <- which(
+      brain_horizontal_meta$cell_type == ct
+    )
+    
+    Matrix::rowMeans(
+      expr_sub[
+        ,
+        cols,
+        drop = FALSE
+      ]
+    )
+  }
+)
+
+avg_mat <- as.matrix(avg_mat)
+
+label_df <- brain_horizontal_meta %>%
+  group_by(cell_type) %>%
+  summarise(
+    d = n_distinct(donor_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[
+  match(
+    cell_types_ordered,
+    label_df$cell_type
+  ),
+]
+
+colnames(avg_mat) <- paste0(
+  label_df$cell_type,
+  " (d=",
+  label_df$d,
+  ", n=",
+  label_df$n,
+  ")"
+)
+
+legend_max <- as.numeric(
+  quantile(
+    avg_mat,
+    0.99,
+    na.rm = TRUE
+  )
+)
+
+col_fun <- colorRamp2(
+  c(
+    0,
+    legend_max / 2,
+    legend_max
+  ),
+  c(
+    "#2166AC",
+    "#D0D0D0",
+    "#B2182B"
+  )
+)
+
+ht <- Heatmap(
+  avg_mat,
+  
+  name = "Mean expression\nlog(CPM/100 + 1)",
+  
+  col = col_fun,
+  
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  rect_gp = gpar(
+    col = "white",
+    lwd = 1.2
+  ),
+  
+  row_names_gp = gpar(
+    fontsize = 16,
+    fontface = "bold"
+  ),
+  
+  row_names_side = "left",
+  
+  column_names_side = "bottom",
+  column_names_rot = 90,
+  
+  column_names_gp = gpar(
+    fontsize = 10,
+    fontface = "bold"
+  ),
+  
+  width = unit(
+    46,
+    "cm"
+  ),
+  
+  height = unit(
+    6,
+    "cm"
+  ),
+  
+  heatmap_legend_param = list(
+    title_gp = gpar(
+      fontsize = 14,
+      fontface = "bold"
+    ),
+    labels_gp = gpar(
+      fontsize = 12
+    )
+  ),
+  
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    
+    val <- avg_mat[i, j]
+    
+    lab <- if (val < 0.005) {
+      "0"
+    } else {
+      sprintf("%.3f", val)
+    }
+    
+    grid.text(
+      lab,
+      x,
+      y,
+      gp = gpar(
+        fontsize = 8,
+        fontface = "bold",
+        col = "black"
+      )
+    )
+  }
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+png(
+  "brain_CD24_SIGLEC10_horizontal_grouped_order_heatmap_presentation.png",
+  width = 6000,
+  height = 2400,
+  res = 300
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+dev.off()
+```
+
+#### Vertical Long:
+
+```{r}
+
+# Vertical Long Heatmap
+# Brain detailed cell types ordered by broad lineage
+# No category titles shown
+# Presentation version: bigger bold text + higher resolution
+
+library(SingleCellExperiment)
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c(
+  "CD24",
+  "SIGLEC10"
+)
+
+expr_mat <- assay(
+  brain_ped_healthy_qc,
+  "X"
+)
+
+gene_col <- intersect(
+  c(
+    "gene_name",
+    "gene_symbol",
+    "symbol",
+    "feature_name"
+  ),
+  colnames(
+    rowData(
+      brain_ped_healthy_qc
+    )
+  )
+)[1]
+
+if (is.na(gene_col)) {
+  
+  gene_names <- rownames(
+    brain_ped_healthy_qc
+  )
+  
+} else {
+  
+  gene_names <- as.character(
+    rowData(
+      brain_ped_healthy_qc
+    )[[gene_col]]
+  )
+}
+
+brain_vertical_meta <- as.data.frame(
+  colData(
+    brain_ped_healthy_qc
+  )
+)
+
+keep_cells <- !is.na(brain_vertical_meta$cell_type) &
+              brain_vertical_meta$cell_type != "" &
+              !is.na(brain_vertical_meta$donor_id)
+
+brain_vertical_meta <- brain_vertical_meta[
+  keep_cells,
+  ,
+  drop = FALSE
+]
+
+expr_mat <- expr_mat[
+  ,
+  keep_cells,
+  drop = FALSE
+]
+
+gene_idx <- match(
+  genes_to_plot,
+  gene_names
+)
+
+present <- !is.na(gene_idx)
+
+if (!any(present)) {
+  stop("Requested genes not found.")
+}
+
+genes_present <- genes_to_plot[present]
+gene_idx <- gene_idx[present]
+
+expr_sub <- expr_mat[
+  gene_idx,
+  ,
+  drop = FALSE
+]
+
+rownames(expr_sub) <- genes_present
+
+# ------------------------------------
+# Order detailed brain cell types by broad lineage
+# No category headers shown
+# ------------------------------------
+
+cell_types <- unique(
+  brain_vertical_meta$cell_type
+)
+
+cell_type_info <- data.frame(
+  cell_type = cell_types,
+  stringsAsFactors = FALSE
+)
+
+cell_type_info$cell_group <- case_when(
+  grepl(
+    "glutamatergic|GABAergic|neuron|neuronal|interneuron|excitatory|inhibitory|CA1|CA2|CA3|dentate|granule",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Neurons",
+  
+  grepl(
+    "astrocyte",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Astrocytes",
+  
+  grepl(
+    "oligodendrocyte precursor|OPC|precursor",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Oligodendrocyte lineage",
+  
+  grepl(
+    "oligodendrocyte",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Oligodendrocyte lineage",
+  
+  grepl(
+    "microglia|macrophage|monocyte|myeloid",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Microglia / myeloid",
+  
+  grepl(
+    "endothelial|vascular|capillary|arterial|venous",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Vascular",
+  
+  grepl(
+    "pericyte|smooth muscle|mural",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Vascular",
+  
+  grepl(
+    "ependymal|choroid",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Ependymal / choroid",
+  
+  grepl(
+    "T cell|B cell|NK cell|lymphocyte|immune",
+    cell_type_info$cell_type,
+    ignore.case = TRUE
+  ) ~ "Immune",
+  
+  TRUE ~ "Other"
+)
+
+group_order <- c(
+  "Neurons",
+  "Astrocytes",
+  "Oligodendrocyte lineage",
+  "Microglia / myeloid",
+  "Vascular",
+  "Ependymal / choroid",
+  "Immune",
+  "Other"
+)
+
+cell_type_info$cell_group <- factor(
+  cell_type_info$cell_group,
+  levels = group_order
+)
+
+cell_type_info$cell_type_order <- case_when(
+  grepl("GABAergic|inhibitory|interneuron", cell_type_info$cell_type, ignore.case = TRUE) ~ 1,
+  grepl("glutamatergic|excitatory", cell_type_info$cell_type, ignore.case = TRUE) ~ 2,
+  grepl("CA1|CA2|CA3", cell_type_info$cell_type, ignore.case = TRUE) ~ 3,
+  grepl("dentate|granule", cell_type_info$cell_type, ignore.case = TRUE) ~ 4,
+  grepl("neuron", cell_type_info$cell_type, ignore.case = TRUE) ~ 5,
+  
+  grepl("astrocyte", cell_type_info$cell_type, ignore.case = TRUE) ~ 10,
+  
+  grepl("oligodendrocyte precursor|OPC", cell_type_info$cell_type, ignore.case = TRUE) ~ 20,
+  grepl("oligodendrocyte", cell_type_info$cell_type, ignore.case = TRUE) ~ 21,
+  
+  grepl("microglia", cell_type_info$cell_type, ignore.case = TRUE) ~ 30,
+  grepl("macrophage|monocyte|myeloid", cell_type_info$cell_type, ignore.case = TRUE) ~ 31,
+  
+  grepl("endothelial|capillary", cell_type_info$cell_type, ignore.case = TRUE) ~ 40,
+  grepl("pericyte|smooth muscle|mural", cell_type_info$cell_type, ignore.case = TRUE) ~ 41,
+  
+  grepl("ependymal", cell_type_info$cell_type, ignore.case = TRUE) ~ 50,
+  grepl("choroid", cell_type_info$cell_type, ignore.case = TRUE) ~ 51,
+  
+  grepl("T cell", cell_type_info$cell_type, ignore.case = TRUE) ~ 60,
+  grepl("B cell", cell_type_info$cell_type, ignore.case = TRUE) ~ 61,
+  grepl("NK cell", cell_type_info$cell_type, ignore.case = TRUE) ~ 62,
+  
+  TRUE ~ 99
+)
+
+cell_type_info <- cell_type_info %>%
+  arrange(
+    cell_group,
+    cell_type_order,
+    cell_type
+  )
+
+cell_types_ordered <- cell_type_info$cell_type
+
+# Average expression by ordered cell type
+
+avg_list <- lapply(
+  cell_types_ordered,
+  function(ct) {
+    
+    cols <- which(
+      brain_vertical_meta$cell_type == ct
+    )
+    
+    Matrix::rowMeans(
+      expr_sub[
+        ,
+        cols,
+        drop = FALSE
+      ]
+    )
+  }
+)
+
+avg_mat <- do.call(
+  cbind,
+  avg_list
+)
+
+avg_mat <- as.matrix(avg_mat)
+
+rownames(avg_mat) <- genes_present
+colnames(avg_mat) <- cell_types_ordered
+
+heatmap_mat <- t(avg_mat)
+
+label_df <- brain_vertical_meta %>%
+  group_by(cell_type) %>%
+  summarise(
+    d = n_distinct(donor_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[
+  match(
+    rownames(heatmap_mat),
+    label_df$cell_type
+  ),
+]
+
+valid <- !is.na(
+  label_df$cell_type
+)
+
+heatmap_mat <- heatmap_mat[
+  valid,
+  ,
+  drop = FALSE
+]
+
+label_df <- label_df[
+  valid,
+  ,
+  drop = FALSE
+]
+
+rownames(heatmap_mat) <- paste0(
+  label_df$cell_type,
+  " (d=",
+  label_df$d,
+  ", n=",
+  label_df$n,
+  ")"
+)
+
+legend_min <- 0
+
+legend_max <- as.numeric(
+  quantile(
+    heatmap_mat,
+    probs = 0.99,
+    na.rm = TRUE
+  )
+)
+
+legend_mid <- legend_max / 2
+
+col_fun <- colorRamp2(
+  c(
+    legend_min,
+    legend_mid,
+    legend_max
+  ),
+  c(
+    "#2166AC",
+    "#D0D0D0",
+    "#B2182B"
+  )
+)
+
+ht <- Heatmap(
+  heatmap_mat,
+  
+  name = "Mean expression\nlog(CPM/100 + 1)",
+  
+  col = col_fun,
+  
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  rect_gp = gpar(
+    col = "white",
+    lwd = 1.2
+  ),
+  
+  row_names_side = "left",
+  
+  row_names_gp = gpar(
+    fontsize = 12,
+    fontface = "bold"
+  ),
+  
+  row_names_max_width = unit(
+    16,
+    "cm"
+  ),
+  
+  column_names_gp = gpar(
+    fontsize = 16,
+    fontface = "bold"
+  ),
+  
+  column_names_rot = 45,
+  
+  width = unit(
+    5.5,
+    "cm"
+  ),
+  
+  height = unit(
+    22,
+    "cm"
+  ),
+  
+  heatmap_legend_param = list(
+    title_gp = gpar(
+      fontsize = 14,
+      fontface = "bold"
+    ),
+    labels_gp = gpar(
+      fontsize = 12
+    )
+  ),
+  
+  cell_fun = function(
+    j, i, x, y,
+    width, height,
+    fill
+  ) {
+    
+    val <- heatmap_mat[i, j]
+    
+    lab <- if (
+      val < 0.005
+    ) {
+      "0"
+    } else {
+      sprintf("%.4f", val)
+    }
+    
+    grid.text(
+      lab,
+      x,
+      y,
+      gp = gpar(
+        fontsize = 9,
+        fontface = "bold",
+        col = "black"
+      )
+    )
+  }
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+png(
+  "brain_CD24_SIGLEC10_vertical_grouped_order_heatmap_presentation.png",
+  width = 3400,
+  height = 4200,
+  res = 300
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right"
+)
+
+dev.off()
+```

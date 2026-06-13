@@ -1,0 +1,1321 @@
+---
+title: "Pheast_growthplate"
+format: html
+editor: visual
+---
+
+## Loading in dataset
+
+```{r}
+library(Seurat)
+library(dplyr)
+
+# Find all h5 files
+h5_files <- list.files(
+  pattern = "\\.h5$",
+  full.names = TRUE
+)
+
+h5_files
+```
+
+```{r}
+seurat_list <- lapply(h5_files, function(f) {
+
+  counts <- Read10X_h5(f)
+
+  sample_name <- tools::file_path_sans_ext(
+    basename(f)
+  )
+
+  obj <- CreateSeuratObject(
+    counts = counts,
+    project = sample_name
+  )
+
+  obj$sample_id <- sample_name
+
+  obj
+})
+```
+
+```{r}
+bone_seurat <- merge(
+  seurat_list[[1]],
+  y = seurat_list[-1]
+)
+
+bone_seurat
+
+```
+
+QC:
+
+```{r}
+
+# =========================
+# Chunk 1
+# Metadata + pediatric dataset
+# =========================
+
+library(Seurat)
+library(SeuratObject)
+library(Matrix)
+library(dplyr)
+library(stringr)
+
+# Rebuild metadata safely
+
+bone_seurat$sample_id <- bone_seurat$orig.ident
+
+bone_seurat$donor_id <- str_extract(
+  bone_seurat$sample_id,
+  "P[0-9]+"
+)
+
+bone_seurat$age_years <- case_when(
+  bone_seurat$donor_id == "P30453" ~ 4,
+  bone_seurat$donor_id == "P31011" ~ 7,
+  bone_seurat$donor_id == "P25452" ~ 12,
+  bone_seurat$donor_id == "P22202" ~ 16,
+  bone_seurat$donor_id == "P27153" ~ 17,
+  TRUE ~ NA_real_
+)
+
+# All donors already pediatric
+
+bone_ped <- bone_seurat
+
+cat(
+  "Cell count before QC:",
+  ncol(bone_ped),
+  "\n"
+)
+
+cat(
+  "Number of donors:",
+  length(
+    unique(
+      bone_ped$donor_id
+    )
+  ),
+  "\n"
+)
+
+cat(
+  "\nAges of donors:\n"
+)
+
+print(
+  table(
+    bone_ped$age_years
+  )
+)
+```
+
+#### QC:
+
+```{r}
+# =========================
+# Chunk 2
+# Growth plate QC
+# =========================
+
+library(Seurat)
+library(Matrix)
+library(dplyr)
+
+# Add mitochondrial percentage
+bone_ped[["percent.mito"]] <- PercentageFeatureSet(
+  bone_ped,
+  pattern = "^MT-"
+)
+
+# Context-specific metadata
+growthplate_qc_meta <- bone_ped@meta.data
+
+# QC-passing cell names
+growthplate_qc_cells <- rownames(growthplate_qc_meta)[
+  growthplate_qc_meta$nFeature_RNA >= 200 &
+    growthplate_qc_meta$nCount_RNA >= 500 &
+    growthplate_qc_meta$percent.mito <= 20
+]
+
+cat(
+  "Cell count before QC:",
+  ncol(bone_ped),
+  "\n"
+)
+
+cat(
+  "Cell count after QC:",
+  length(growthplate_qc_cells),
+  "\n"
+)
+
+cat(
+  "Cells removed during QC:",
+  ncol(bone_ped) - length(growthplate_qc_cells),
+  "\n"
+)
+```
+
+#### Normalize:
+
+```{r}
+# =========================
+# Chunk 3
+# Growth plate marker normalization + marker-based cell labels
+# Memory-safe
+# =========================
+
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(stringr)
+
+# Genes for heatmap + growth plate marker genes
+growthplate_genes_to_use <- c(
+  "CD24",
+  "SIGLEC10",
+
+  # Chondrocytes
+  "ACAN",
+  "COL2A1",
+  "COL9A1",
+  "COL10A1",
+  "SOX9",
+  "COMP",
+
+  # MSCs / osteoblasts
+  "COL1A1",
+  "COL1A2",
+  "RUNX2",
+  "ALPL",
+  "SPP1",
+  "IBSP",
+  "BGLAP",
+  "SP7",
+
+  # Myeloid lineage
+  "LYZ",
+  "LST1",
+  "S100A8",
+  "S100A9",
+  "CD14",
+  "FCGR3A",
+
+  # T cells
+  "CD3D",
+  "CD3E",
+  "TRAC",
+
+  # NK cells
+  "NKG7",
+  "GNLY",
+  "KLRD1",
+
+  # Naive B cells
+  "MS4A1",
+  "CD79A",
+  "CD79B",
+  "CD74",
+  "TCL1A",
+  "IGHD",
+
+  # Plasma cells
+  "MZB1",
+  "XBP1",
+  "JCHAIN",
+  "IGKC",
+
+  # Endothelial cells
+  "PECAM1",
+  "VWF",
+  "KDR",
+  "CLDN5",
+
+  # Vascular smooth muscle / pericytes
+  "ACTA2",
+  "TAGLN",
+  "MYH11",
+  "RGS5",
+  "PDGFRB",
+
+  # Plasmacytoid dendritic cells
+  "IL3RA",
+  "CLEC4C",
+  "TCF4",
+  "GZMB"
+)
+
+growthplate_genes_to_use <- unique(growthplate_genes_to_use)
+
+# Count layers
+growthplate_count_layers <- grep(
+  "^counts",
+  Layers(bone_ped[["RNA"]]),
+  value = TRUE
+)
+
+if (length(growthplate_count_layers) == 0) {
+  stop("No count layers found in bone_ped[['RNA']].")
+}
+
+# Normalize only marker genes for QC-passing cells
+growthplate_expr_list <- lapply(
+  growthplate_count_layers,
+  function(layer_name) {
+
+    cat("Processing layer:", layer_name, "\n")
+
+    growthplate_counts <- GetAssayData(
+      bone_ped,
+      layer = layer_name
+    )
+
+    # Keep only QC-passing cells present in this layer
+    growthplate_layer_cells <- intersect(
+      colnames(growthplate_counts),
+      growthplate_qc_cells
+    )
+
+    growthplate_counts <- growthplate_counts[
+      ,
+      growthplate_layer_cells,
+      drop = FALSE
+    ]
+
+    # Empty layer protection
+    if (ncol(growthplate_counts) == 0) {
+
+      growthplate_empty <- Matrix(
+        0,
+        nrow = length(growthplate_genes_to_use),
+        ncol = 0,
+        sparse = TRUE
+      )
+
+      rownames(growthplate_empty) <- growthplate_genes_to_use
+
+      return(growthplate_empty)
+    }
+
+    growthplate_out <- Matrix(
+      0,
+      nrow = length(growthplate_genes_to_use),
+      ncol = ncol(growthplate_counts),
+      sparse = TRUE
+    )
+
+    rownames(growthplate_out) <- growthplate_genes_to_use
+    colnames(growthplate_out) <- colnames(growthplate_counts)
+
+    growthplate_present_genes <- intersect(
+      growthplate_genes_to_use,
+      rownames(growthplate_counts)
+    )
+
+    if (length(growthplate_present_genes) > 0) {
+
+      growthplate_sub_counts <- growthplate_counts[
+        growthplate_present_genes,
+        ,
+        drop = FALSE
+      ]
+
+      growthplate_lib_size <- Matrix::colSums(growthplate_counts)
+      growthplate_lib_size[growthplate_lib_size == 0] <- NA
+
+      growthplate_norm <- t(
+        t(growthplate_sub_counts) / growthplate_lib_size
+      ) * 10000
+
+      growthplate_norm <- log1p(growthplate_norm)
+      growthplate_norm[is.na(growthplate_norm)] <- 0
+
+      growthplate_out[growthplate_present_genes, ] <- growthplate_norm
+    }
+
+    growthplate_out
+  }
+)
+
+growthplate_expr_marker <- do.call(
+  cbind,
+  growthplate_expr_list
+)
+
+growthplate_expr_marker <- as(
+  growthplate_expr_marker,
+  "dgCMatrix"
+)
+
+# Metadata for normalized cells
+growthplate_meta <- bone_ped@meta.data
+
+growthplate_meta <- growthplate_meta[
+  colnames(growthplate_expr_marker),
+  ,
+  drop = FALSE
+]
+
+# Make sure donor_id exists
+if (!"donor_id" %in% colnames(growthplate_meta)) {
+
+  growthplate_meta$sample_id <- growthplate_meta$orig.ident
+
+  growthplate_meta$donor_id <- str_extract(
+    growthplate_meta$sample_id,
+    "P[0-9]+"
+  )
+}
+
+# Marker scoring function
+growthplate_marker_score <- function(genes) {
+
+  present <- intersect(
+    genes,
+    rownames(growthplate_expr_marker)
+  )
+
+  if (length(present) == 0) {
+    return(rep(0, ncol(growthplate_expr_marker)))
+  }
+
+  Matrix::colMeans(
+    growthplate_expr_marker[
+      present,
+      ,
+      drop = FALSE
+    ]
+  )
+}
+
+# Growth plate marker-based cell labels
+growthplate_scores <- data.frame(
+  Chondrocytes = growthplate_marker_score(c(
+    "ACAN", "COL2A1", "COL9A1", "COL10A1", "SOX9", "COMP"
+  )),
+
+  `Mesenchymal stem cells / osteoblasts` = growthplate_marker_score(c(
+    "COL1A1", "COL1A2", "RUNX2", "ALPL", "SPP1", "IBSP", "BGLAP", "SP7"
+  )),
+
+  `Myeloid lineage` = growthplate_marker_score(c(
+    "LYZ", "LST1", "S100A8", "S100A9", "CD14", "FCGR3A"
+  )),
+
+  `T cells` = growthplate_marker_score(c(
+    "CD3D", "CD3E", "TRAC"
+  )),
+
+  `NK cells` = growthplate_marker_score(c(
+    "NKG7", "GNLY", "KLRD1"
+  )),
+
+  `Naive B cells` = growthplate_marker_score(c(
+    "MS4A1", "CD79A", "CD79B", "CD74", "TCL1A", "IGHD"
+  )),
+
+  `Plasma cells` = growthplate_marker_score(c(
+    "MZB1", "XBP1", "JCHAIN", "IGKC"
+  )),
+
+  `Endothelial cells` = growthplate_marker_score(c(
+    "PECAM1", "VWF", "KDR", "CLDN5"
+  )),
+
+  `Vascular smooth muscle cells` = growthplate_marker_score(c(
+    "ACTA2", "TAGLN", "MYH11", "RGS5", "PDGFRB"
+  )),
+
+  `Plasmacytoid dendritic cells` = growthplate_marker_score(c(
+    "IL3RA", "CLEC4C", "TCF4", "GZMB"
+  )),
+
+  check.names = FALSE
+)
+
+growthplate_max_score <- apply(
+  growthplate_scores,
+  1,
+  max,
+  na.rm = TRUE
+)
+
+growthplate_cell_type <- colnames(growthplate_scores)[
+  max.col(
+    growthplate_scores,
+    ties.method = "first"
+  )
+]
+
+growthplate_cell_type[
+  growthplate_max_score < 0.05
+] <- "Other"
+
+growthplate_meta$cell_type <- growthplate_cell_type
+
+# Heatmap expression matrix
+growthplate_expr_sub <- growthplate_expr_marker[
+  c("CD24", "SIGLEC10"),
+  ,
+  drop = FALSE
+]
+
+# Compatibility names for your existing heatmap chunks
+expr_marker <- growthplate_expr_marker
+expr_sub <- growthplate_expr_sub
+meta_bone <- growthplate_meta
+
+cat("\nGrowth plate cell type counts:\n")
+
+print(
+  sort(
+    table(meta_bone$cell_type),
+    decreasing = TRUE
+  )
+)
+
+cat("\nExpression matrix for heatmaps:\n")
+print(dim(expr_sub))
+print(rownames(expr_sub))
+
+cat("\nNormalization complete:\n")
+cat("log1p(counts per 10k)\n")
+```
+
+```{r}
+# Check metadata columns in the Seurat object
+
+colnames(bone_seurat@meta.data)
+
+grep(
+  "cell|type|annot|label|cluster|class|identity|ident|lineage",
+  colnames(bone_seurat@meta.data),
+  value = TRUE,
+  ignore.case = TRUE
+)
+```
+
+#### Heat maps : \[ NO detailed cell types in this data set\]
+
+```{r}
+# =========================
+# Growth plate marker-based cell type labels
+# Memory-safe
+# =========================
+
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(stringr)
+
+# Make sure percent.mito exists
+if (!"percent.mito" %in% colnames(bone_ped@meta.data)) {
+  bone_ped[["percent.mito"]] <- PercentageFeatureSet(
+    bone_ped,
+    pattern = "^MT-"
+  )
+}
+
+# Context-specific QC metadata
+growthplate_qc_meta <- bone_ped@meta.data
+
+# QC-passing cell names
+growthplate_qc_cells <- rownames(growthplate_qc_meta)[
+  growthplate_qc_meta$nFeature_RNA >= 200 &
+    growthplate_qc_meta$nCount_RNA >= 500 &
+    growthplate_qc_meta$percent.mito <= 20
+]
+
+cat(
+  "Growth plate cells before QC:",
+  ncol(bone_ped),
+  "\n"
+)
+
+cat(
+  "Growth plate cells after QC:",
+  length(growthplate_qc_cells),
+  "\n"
+)
+
+# Heatmap genes + growth plate marker genes
+growthplate_genes_to_use <- c(
+  "CD24",
+  "SIGLEC10",
+  
+  # Chondrocytes
+  "ACAN",
+  "COL2A1",
+  "COL9A1",
+  "COL10A1",
+  "SOX9",
+  "COMP",
+  
+  # Mesenchymal stem cells / osteoblasts
+  "COL1A1",
+  "COL1A2",
+  "RUNX2",
+  "ALPL",
+  "SPP1",
+  "IBSP",
+  "BGLAP",
+  "SP7",
+  
+  # Myeloid lineage
+  "LYZ",
+  "LST1",
+  "S100A8",
+  "S100A9",
+  "CD14",
+  "FCGR3A",
+  
+  # T cells
+  "CD3D",
+  "CD3E",
+  "TRAC",
+  
+  # NK cells
+  "NKG7",
+  "GNLY",
+  "KLRD1",
+  
+  # Naive B cells
+  "MS4A1",
+  "CD79A",
+  "CD79B",
+  "CD74",
+  "TCL1A",
+  "IGHD",
+  
+  # Plasma cells
+  "MZB1",
+  "XBP1",
+  "JCHAIN",
+  "IGKC",
+  
+  # Endothelial cells
+  "PECAM1",
+  "VWF",
+  "KDR",
+  "CLDN5",
+  
+  # Vascular smooth muscle / pericytes
+  "ACTA2",
+  "TAGLN",
+  "MYH11",
+  "RGS5",
+  "PDGFRB",
+  
+  # Plasmacytoid dendritic cells
+  "IL3RA",
+  "CLEC4C",
+  "TCF4",
+  "GZMB"
+)
+
+growthplate_genes_to_use <- unique(growthplate_genes_to_use)
+
+growthplate_count_layers <- grep(
+  "^counts",
+  Layers(bone_ped[["RNA"]]),
+  value = TRUE
+)
+
+growthplate_expr_list <- lapply(
+  growthplate_count_layers,
+  function(layer_name) {
+    
+    cat("Processing layer:", layer_name, "\n")
+    
+    growthplate_counts <- GetAssayData(
+      bone_ped,
+      layer = layer_name
+    )
+    
+    # Keep only QC-passing cells present in this layer
+    growthplate_layer_cells <- intersect(
+      colnames(growthplate_counts),
+      growthplate_qc_cells
+    )
+    
+    growthplate_counts <- growthplate_counts[
+      ,
+      growthplate_layer_cells,
+      drop = FALSE
+    ]
+    
+    if (ncol(growthplate_counts) == 0) {
+      
+      growthplate_empty <- Matrix(
+        0,
+        nrow = length(growthplate_genes_to_use),
+        ncol = 0,
+        sparse = TRUE
+      )
+      
+      rownames(growthplate_empty) <- growthplate_genes_to_use
+      
+      return(growthplate_empty)
+    }
+    
+    growthplate_out <- Matrix(
+      0,
+      nrow = length(growthplate_genes_to_use),
+      ncol = ncol(growthplate_counts),
+      sparse = TRUE
+    )
+    
+    rownames(growthplate_out) <- growthplate_genes_to_use
+    colnames(growthplate_out) <- colnames(growthplate_counts)
+    
+    growthplate_present_genes <- intersect(
+      growthplate_genes_to_use,
+      rownames(growthplate_counts)
+    )
+    
+    if (length(growthplate_present_genes) > 0) {
+      
+      growthplate_sub_counts <- growthplate_counts[
+        growthplate_present_genes,
+        ,
+        drop = FALSE
+      ]
+      
+      growthplate_lib_size <- Matrix::colSums(growthplate_counts)
+      growthplate_lib_size[growthplate_lib_size == 0] <- NA
+      
+      growthplate_norm <- t(
+        t(growthplate_sub_counts) / growthplate_lib_size
+      ) * 10000
+      
+      growthplate_norm <- log1p(growthplate_norm)
+      growthplate_norm[is.na(growthplate_norm)] <- 0
+      
+      growthplate_out[growthplate_present_genes, ] <- growthplate_norm
+    }
+    
+    growthplate_out
+  }
+)
+
+growthplate_expr_marker <- do.call(
+  cbind,
+  growthplate_expr_list
+)
+
+growthplate_expr_marker <- as(
+  growthplate_expr_marker,
+  "dgCMatrix"
+)
+
+# Context-specific metadata for normalized cells
+growthplate_meta <- bone_ped@meta.data
+
+growthplate_meta <- growthplate_meta[
+  colnames(growthplate_expr_marker),
+  ,
+  drop = FALSE
+]
+
+if (!"donor_id" %in% colnames(growthplate_meta)) {
+  growthplate_meta$sample_id <- growthplate_meta$orig.ident
+  
+  growthplate_meta$donor_id <- str_extract(
+    growthplate_meta$sample_id,
+    "P[0-9]+"
+  )
+}
+
+growthplate_marker_score <- function(genes) {
+  
+  present <- intersect(
+    genes,
+    rownames(growthplate_expr_marker)
+  )
+  
+  if (length(present) == 0) {
+    return(rep(0, ncol(growthplate_expr_marker)))
+  }
+  
+  Matrix::colMeans(
+    growthplate_expr_marker[
+      present,
+      ,
+      drop = FALSE
+    ]
+  )
+}
+
+growthplate_scores <- data.frame(
+  Chondrocytes = growthplate_marker_score(c(
+    "ACAN", "COL2A1", "COL9A1", "COL10A1", "SOX9", "COMP"
+  )),
+  
+  `Mesenchymal stem cells / osteoblasts` = growthplate_marker_score(c(
+    "COL1A1", "COL1A2", "RUNX2", "ALPL", "SPP1", "IBSP", "BGLAP", "SP7"
+  )),
+  
+  `Myeloid lineage` = growthplate_marker_score(c(
+    "LYZ", "LST1", "S100A8", "S100A9", "CD14", "FCGR3A"
+  )),
+  
+  `T cells` = growthplate_marker_score(c(
+    "CD3D", "CD3E", "TRAC"
+  )),
+  
+  `NK cells` = growthplate_marker_score(c(
+    "NKG7", "GNLY", "KLRD1"
+  )),
+  
+  `Naive B cells` = growthplate_marker_score(c(
+    "MS4A1", "CD79A", "CD79B", "CD74", "TCL1A", "IGHD"
+  )),
+  
+  `Plasma cells` = growthplate_marker_score(c(
+    "MZB1", "XBP1", "JCHAIN", "IGKC"
+  )),
+  
+  `Endothelial cells` = growthplate_marker_score(c(
+    "PECAM1", "VWF", "KDR", "CLDN5"
+  )),
+  
+  `Vascular smooth muscle cells` = growthplate_marker_score(c(
+    "ACTA2", "TAGLN", "MYH11", "RGS5", "PDGFRB"
+  )),
+  
+  `Plasmacytoid dendritic cells` = growthplate_marker_score(c(
+    "IL3RA", "CLEC4C", "TCF4", "GZMB"
+  )),
+  
+  check.names = FALSE
+)
+
+growthplate_max_score <- apply(
+  growthplate_scores,
+  1,
+  max,
+  na.rm = TRUE
+)
+
+growthplate_assigned_cell_type <- colnames(growthplate_scores)[
+  max.col(
+    growthplate_scores,
+    ties.method = "first"
+  )
+]
+
+growthplate_assigned_cell_type[
+  growthplate_max_score < 0.05
+] <- "Other"
+
+growthplate_meta$cell_type <- growthplate_assigned_cell_type
+
+cat("Growth plate cell type counts:\n")
+
+print(
+  sort(
+    table(growthplate_meta$cell_type),
+    decreasing = TRUE
+  )
+)
+
+growthplate_expr_sub <- growthplate_expr_marker[
+  c("CD24", "SIGLEC10"),
+  ,
+  drop = FALSE
+]
+
+# Compatibility names for your existing heatmap chunks
+expr_marker <- growthplate_expr_marker
+expr_sub <- growthplate_expr_sub
+meta_bone <- growthplate_meta
+
+cat("\nExpression matrix for heatmap:\n")
+print(dim(expr_sub))
+print(rownames(expr_sub))
+
+cat("\nNormalization complete:\n")
+cat("Mean expression\nlog(CPM/100 + 1)")
+```
+
+#### Horizontal Long:
+
+```{r}
+# Horizontal Long Heatmap
+# Growth plate marker-based labels
+# CD24 + SIGLEC10
+
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+# Use already-created normalized expression matrix
+expr_hm <- expr_sub[
+  genes_to_plot,
+  ,
+  drop = FALSE
+]
+
+# Match metadata to expression matrix cells
+meta_hm <- meta_bone[
+  colnames(expr_hm),
+  ,
+  drop = FALSE
+]
+
+# Keep valid cell labels
+keep_valid <- !is.na(meta_hm$cell_type) &
+              meta_hm$cell_type != ""
+
+meta_hm <- meta_hm[
+  keep_valid,
+  ,
+  drop = FALSE
+]
+
+expr_hm <- expr_hm[
+  ,
+  keep_valid,
+  drop = FALSE
+]
+
+# Growth plate cell type order
+cell_type_order <- c(
+  "Chondrocytes",
+  "Mesenchymal stem cells / osteoblasts",
+  "Endothelial cells",
+  "Vascular smooth muscle cells",
+  "Myeloid lineage",
+  "Plasmacytoid dendritic cells",
+  "T cells",
+  "NK cells",
+  "Naive B cells",
+  "Plasma cells",
+  "Other"
+)
+
+cell_types <- cell_type_order[
+  cell_type_order %in% unique(meta_hm$cell_type)
+]
+
+# Average expression by cell type
+avg_mat <- sapply(
+  cell_types,
+  function(ct) {
+    cols <- which(meta_hm$cell_type == ct)
+
+    Matrix::rowMeans(
+      expr_hm[
+        ,
+        cols,
+        drop = FALSE
+      ]
+    )
+  }
+)
+
+avg_mat <- as.matrix(avg_mat)
+
+# Donor and cell counts
+label_df <- meta_hm %>%
+  group_by(cell_type) %>%
+  summarise(
+    d = n_distinct(donor_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[
+  match(
+    cell_types,
+    label_df$cell_type
+  ),
+]
+
+# Long labels on x-axis
+colnames(avg_mat) <- paste0(
+  label_df$cell_type,
+  " (d=",
+  label_df$d,
+  ", n=",
+  label_df$n,
+  ")"
+)
+
+# Color scale
+legend_min <- 0
+
+legend_max <- as.numeric(
+  quantile(
+    avg_mat,
+    probs = 0.99,
+    na.rm = TRUE
+  )
+)
+
+legend_mid <- legend_max / 2
+
+col_fun <- colorRamp2(
+  c(
+    legend_min,
+    legend_mid,
+    legend_max
+  ),
+  c(
+    "#2166AC",
+    "#D0D0D0",
+    "#B2182B"
+  )
+)
+
+# Heatmap
+ht <- Heatmap(
+  avg_mat,
+
+  name = "Mean expression\nlog(CPM/100 + 1)",
+
+  col = col_fun,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+
+  rect_gp = gpar(
+    col = "white",
+    lwd = 1
+  ),
+
+  row_names_side = "left",
+
+  row_names_gp = gpar(
+    fontsize = 16,
+    fontface = "bold"
+  ),
+
+  column_names_side = "bottom",
+
+  column_names_rot = 90,
+
+  column_names_gp = gpar(
+    fontsize = 13,
+    fontface = "bold"
+  ),
+
+  width = unit(
+    40,
+    "cm"
+  ),
+
+  height = unit(
+    7,
+    "cm"
+  ),
+
+  heatmap_legend_param = list(
+    title_gp = gpar(
+      fontsize = 15,
+      fontface = "bold"
+    ),
+    labels_gp = gpar(
+      fontsize = 13,
+      fontface = "bold"
+    )
+  ),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- avg_mat[i, j]
+
+    lab <- if (val < 0.005) {
+      "0"
+    } else {
+      sprintf("%.3f", val)
+    }
+
+    grid.text(
+      lab,
+      x,
+      y,
+      gp = gpar(
+        fontsize = 9,
+        fontface = "bold",
+        col = "black"
+      )
+    )
+  }
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  padding = unit(c(10, 30, 30, 30), "mm")
+)
+
+png(
+  "growthplate_CD24_SIGLEC10_horizontal_long_celltype_heatmap_presentation.png",
+  width = 9000,
+  height = 3800,
+  res = 300
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  padding = unit(c(10, 30, 30, 30), "mm")
+)
+
+dev.off()
+```
+
+#### Vertical long:
+
+```{r}
+# Vertical Long Heatmap
+# Growth plate marker-based labels
+# CD24 + SIGLEC10
+
+library(Matrix)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+genes_to_plot <- c("CD24", "SIGLEC10")
+
+# Use already-created normalized expression matrix
+expr_hm <- expr_sub[
+  genes_to_plot,
+  ,
+  drop = FALSE
+]
+
+# Match metadata to expression matrix cells
+meta_hm <- meta_bone[
+  colnames(expr_hm),
+  ,
+  drop = FALSE
+]
+
+# Keep valid cell labels
+keep_valid <- !is.na(meta_hm$cell_type) &
+              meta_hm$cell_type != ""
+
+meta_hm <- meta_hm[
+  keep_valid,
+  ,
+  drop = FALSE
+]
+
+expr_hm <- expr_hm[
+  ,
+  keep_valid,
+  drop = FALSE
+]
+
+# Growth plate cell type order
+cell_type_order <- c(
+  "Chondrocytes",
+  "Mesenchymal stem cells / osteoblasts",
+  "Endothelial cells",
+  "Vascular smooth muscle cells",
+  "Myeloid lineage",
+  "Plasmacytoid dendritic cells",
+  "T cells",
+  "NK cells",
+  "Naive B cells",
+  "Plasma cells",
+  "Other"
+)
+
+cell_types <- cell_type_order[
+  cell_type_order %in% unique(meta_hm$cell_type)
+]
+
+# Average expression by cell type
+avg_mat <- sapply(
+  cell_types,
+  function(ct) {
+    cols <- which(meta_hm$cell_type == ct)
+
+    Matrix::rowMeans(
+      expr_hm[
+        ,
+        cols,
+        drop = FALSE
+      ]
+    )
+  }
+)
+
+avg_mat <- as.matrix(avg_mat)
+
+# Donor and cell counts
+label_df <- meta_hm %>%
+  group_by(cell_type) %>%
+  summarise(
+    d = n_distinct(donor_id),
+    n = n(),
+    .groups = "drop"
+  )
+
+label_df <- label_df[
+  match(
+    cell_types,
+    label_df$cell_type
+  ),
+]
+
+# Long labels first
+colnames(avg_mat) <- paste0(
+  label_df$cell_type,
+  " (d=",
+  label_df$d,
+  ", n=",
+  label_df$n,
+  ")"
+)
+
+# Make vertical layout
+heatmap_mat <- t(avg_mat)
+
+# Color scale
+legend_min <- 0
+
+legend_max <- as.numeric(
+  quantile(
+    heatmap_mat,
+    probs = 0.99,
+    na.rm = TRUE
+  )
+)
+
+legend_mid <- legend_max / 2
+
+col_fun <- colorRamp2(
+  c(
+    legend_min,
+    legend_mid,
+    legend_max
+  ),
+  c(
+    "#2166AC",
+    "#D0D0D0",
+    "#B2182B"
+  )
+)
+
+# Heatmap
+ht <- Heatmap(
+  heatmap_mat,
+
+  name = "Mean expression\nlog(CPM/100 + 1)",
+
+  col = col_fun,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+
+  rect_gp = gpar(
+    col = "white",
+    lwd = 1
+  ),
+
+  row_names_side = "left",
+
+  row_names_gp = gpar(
+    fontsize = 13,
+    fontface = "bold"
+  ),
+
+  row_names_max_width = unit(
+    18,
+    "cm"
+  ),
+
+  column_names_side = "bottom",
+
+  column_names_rot = 45,
+
+  column_names_gp = gpar(
+    fontsize = 16,
+    fontface = "bold"
+  ),
+
+  width = unit(
+    5,
+    "cm"
+  ),
+
+  height = unit(
+    22,
+    "cm"
+  ),
+
+  heatmap_legend_param = list(
+    title_gp = gpar(
+      fontsize = 15,
+      fontface = "bold"
+    ),
+    labels_gp = gpar(
+      fontsize = 13,
+      fontface = "bold"
+    )
+  ),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- heatmap_mat[i, j]
+
+    lab <- if (val < 0.005) {
+      "0"
+    } else {
+      sprintf("%.4f", val)
+    }
+
+    grid.text(
+      lab,
+      x,
+      y,
+      gp = gpar(
+        fontsize = 9,
+        fontface = "bold",
+        col = "black"
+      )
+    )
+  }
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  padding = unit(c(10, 30, 20, 30), "mm")
+)
+
+png(
+  "growthplate_CD24_SIGLEC10_vertical_long_celltype_heatmap_presentation.png",
+  width = 3600,
+  height = 5200,
+  res = 300
+)
+
+grid.newpage()
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  padding = unit(c(10, 30, 20, 30), "mm")
+)
+
+dev.off()
+```
