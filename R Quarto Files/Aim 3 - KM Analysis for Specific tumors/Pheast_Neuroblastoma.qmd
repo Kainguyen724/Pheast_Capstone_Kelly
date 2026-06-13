@@ -1,0 +1,321 @@
+---
+title: "Pheast_Neuroblastoma"
+format: html
+editor: visual
+---
+
+## Loading in Data set:
+
+```{r}
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+library(survival)
+library(survminer)
+
+base_url <- "https://cbioportal-api.ccdi.cancer.gov/api"
+study_id <- "openpedcan_v15"
+
+expr_profile_id <- "openpedcan_v15_rna_seq_v2_mrna"
+sample_list_id <- "openpedcan_v15_rna_seq_v2_mrna"
+```
+
+```{r}
+#### Pull CD24 expression from OpenPedCan
+
+cd24_entrez <- 100133941
+
+cd24_expr <- request(
+  paste0(
+    base_url,
+    "/molecular-profiles/",
+    expr_profile_id,
+    "/molecular-data/fetch"
+  )
+) %>%
+  req_method("POST") %>%
+  req_body_json(
+    list(
+      entrezGeneIds = list(cd24_entrez),
+      sampleListId = sample_list_id
+    )
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+cd24_expr_clean <- cd24_expr %>%
+  transmute(
+    sampleId = sampleId,
+    patientId = patientId,
+    CD24_expr = as.numeric(value)
+  ) %>%
+  filter(!is.na(CD24_expr))
+
+head(cd24_expr_clean)
+summary(cd24_expr_clean$CD24_expr)
+nrow(cd24_expr_clean)
+```
+
+```{r}
+#### Pull OpenPedCan clinical data
+
+openped_clinical_sample <- request(
+  paste0(base_url, "/studies/", study_id, "/clinical-data")
+) %>%
+  req_url_query(
+    clinicalDataType = "SAMPLE",
+    projection = "DETAILED"
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+openped_clinical_patient <- request(
+  paste0(base_url, "/studies/", study_id, "/clinical-data")
+) %>%
+  req_url_query(
+    clinicalDataType = "PATIENT",
+    projection = "DETAILED"
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+openped_clinical_sample_wide <- openped_clinical_sample %>%
+  select(sampleId, patientId, clinicalAttributeId, value) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = clinicalAttributeId,
+    values_from = value,
+    values_fn = list(value = dplyr::first)
+  )
+
+openped_clinical_patient_wide <- openped_clinical_patient %>%
+  select(patientId, clinicalAttributeId, value) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = clinicalAttributeId,
+    values_from = value,
+    values_fn = list(value = dplyr::first)
+  )
+
+openped_clinical <- openped_clinical_sample_wide %>%
+  left_join(
+    openped_clinical_patient_wide,
+    by = "patientId"
+  )
+
+colnames(openped_clinical)[
+  str_detect(
+    colnames(openped_clinical),
+    regex("AGE|OS|SURV|DEATH|VITAL|STATUS|MONTH|CANCER|DIAG", ignore_case = TRUE)
+  )
+]
+```
+
+```{r}
+#### OpenPedCan Neuroblastoma: Merge CD24 + Clinical
+
+openped_cd24_surv <- cd24_expr_clean %>%
+  left_join(openped_clinical, by = c("sampleId", "patientId"))
+
+openped_neuro_cd24 <- openped_cd24_surv %>%
+  mutate(
+    age_years = as.numeric(AGE),
+    cancer_type = CANCER_TYPE_DETAILED,
+    os_months = as.numeric(OS_MONTHS),
+    os_event = case_when(
+      str_detect(str_to_upper(OS_STATUS), "DECEASED|DEAD|1:") ~ 1,
+      str_detect(str_to_upper(OS_STATUS), "LIVING|ALIVE|0:") ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    str_detect(cancer_type, regex("neuroblastoma", ignore_case = TRUE)),
+    !is.na(age_years),
+    age_years <= 21,
+    !is.na(CD24_expr),
+    !is.na(os_months),
+    !is.na(os_event)
+  )
+
+openped_neuro_cd24 %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE),
+    median_os_months = median(os_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE)
+  )
+
+table(openped_neuro_cd24$cancer_type)
+
+table(openped_neuro_cd24$os_event)
+```
+
+```{r}
+#### OpenPedCan Neuroblastoma: CD24 High vs Low
+
+openped_neuro_cd24 <- openped_neuro_cd24 %>%
+  mutate(
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High tumors",
+      "CD24 Low tumors"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+openped_neuro_cd24 %>%
+  dplyr::count(CD24_group)
+
+openped_neuro_cd24 %>%
+  group_by(CD24_group) %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    median_age = median(age_years, na.rm = TRUE),
+    median_os_months = median(os_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#### OpenPedCan Neuroblastoma: CD24 High vs Low KM
+
+neuro_fit <- survfit(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openped_neuro_cd24
+)
+
+neuro_logrank <- survdiff(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openped_neuro_cd24
+)
+
+neuro_logrank_p <- 1 - pchisq(
+  neuro_logrank$chisq,
+  df = length(neuro_logrank$n) - 1
+)
+
+neuro_km <- ggsurvplot(
+  neuro_fit,
+  data = openped_neuro_cd24,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.35,
+  pval = paste0("Log-rank p = ", signif(neuro_logrank_p, 3)),
+  pval.coord = c(10, 0.10),
+  conf.int = FALSE,
+  palette = c("black", "#FF1493"),
+  legend.title = "",
+  legend.labs = c(
+    "CD24 Low tumors",
+    "CD24 High tumors"
+  ),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  ggtheme = theme_classic(base_size = 16),
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = FALSE,
+  risk.table.fontsize = 5,
+  tables.theme = theme_classic(base_size = 15)
+)
+
+neuro_km$table <- neuro_km$table +
+  scale_y_discrete(
+    labels = c("CD24 Low tumors", "CD24 High tumors")
+  ) +
+  labs(x = "Overall Survival (Months)") +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(
+      size = 14,
+      color = c("black", "#FF1493")
+    ),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 120)
+  )
+
+neuro_km
+
+png(
+  "OpenPedCan_neuroblastoma_CD24_KM_age21under.png",
+  width = 2200,
+  height = 1600,
+  res = 200
+)
+
+print(neuro_km)
+
+dev.off()
+
+neuro_logrank_p
+```
+
+#### Correlation analysis:
+
+```{r}
+#### OpenPedCan Neuroblastoma: Cox Model
+
+neuro_cox <- coxph(
+  Surv(os_months, os_event) ~ CD24_expr,
+  data = openped_neuro_cd24
+)
+
+summary(neuro_cox)
+```
+
+```{r}
+#### OpenPedCan Neuroblastoma: CD24 Correlation with OS
+
+neuro_pearson <- cor.test(
+  openped_neuro_cd24$CD24_expr,
+  openped_neuro_cd24$os_months,
+  method = "pearson"
+)
+
+neuro_spearman <- cor.test(
+  openped_neuro_cd24$CD24_expr,
+  openped_neuro_cd24$os_months,
+  method = "spearman"
+)
+
+neuro_pearson
+neuro_spearman
+```
+
+```{r}
+#### OpenPedCan Neuroblastoma: CD24 vs OS Scatter Plot
+
+ggplot(
+  openped_neuro_cd24,
+  aes(x = CD24_expr, y = os_months)
+) +
+  geom_point(size = 2.5, alpha = 0.75) +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_classic(base_size = 16) +
+  labs(
+    x = "CD24 Expression",
+    y = "Overall Survival (Months)"
+  )
+
+ggsave(
+  "OpenPedCan_neuroblastoma_CD24_vs_OS_months_age21under.png",
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+```

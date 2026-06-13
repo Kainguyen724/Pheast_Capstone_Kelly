@@ -1,0 +1,1449 @@
+---
+title: "Pheast_Osteosarcoma"
+format: html
+editor: visual
+---
+
+## Loading in data set: TARGET - OS/Xena
+
+```{r}
+library(tidyverse)
+library(survival)
+library(survminer)
+library(limma)
+```
+
+```{r}
+target_expr <- read_tsv(
+  "TARGET-OS.star_counts.tsv",
+  show_col_types = FALSE
+)
+
+target_clinical <- read_tsv(
+  "TARGET-OS.clinical.tsv",
+  show_col_types = FALSE
+)
+
+dim(target_expr)
+dim(target_clinical)
+
+head(target_expr[, 1:5])
+head(target_clinical)
+
+```
+
+```{r}
+target_expr_mat <- target_expr %>%
+  column_to_rownames("Ensembl_ID") %>%
+  as.matrix()
+
+storage.mode(target_expr_mat) <- "numeric"
+
+dim(target_expr_mat)
+target_expr_mat[1:5, 1:3]
+```
+
+```{r}
+# Remove Ensembl version numbers
+target_ensembl_clean <- str_remove(
+  rownames(target_expr_mat),
+  "\\..*$"
+)
+
+# CD24 Ensembl ID
+cd24_ensembl <- "ENSG00000272398"
+
+target_cd24_idx <- which(target_ensembl_clean == cd24_ensembl)
+
+target_cd24_idx
+rownames(target_expr_mat)[target_cd24_idx]
+```
+
+```{r}
+target_cd24_expr <- tibble(
+  sample_id = colnames(target_expr_mat),
+  CD24_expr = as.numeric(target_expr_mat[target_cd24_idx, ])
+)
+
+head(target_cd24_expr)
+summary(target_cd24_expr$CD24_expr)
+```
+
+```{r}
+target_meta <- target_clinical %>%
+  transmute(
+    sample_id = sample,
+    patient_id = submitter_id,
+    vital_status = as.character(`vital_status.demographic`),
+    age_years = as.numeric(
+      `age_at_earliest_diagnosis_in_years.diagnoses.xena_derived`
+    ),
+    days_to_death = as.numeric(`days_to_death.demographic`),
+    days_to_last_follow_up = as.numeric(`days_to_last_follow_up.diagnoses`),
+    sample_type = `sample_type.samples`,
+    tissue_type = `tissue_type.samples`,
+    primary_diagnosis = `primary_diagnosis.diagnoses`
+  ) %>%
+  mutate(
+    os_event = case_when(
+      str_to_upper(vital_status) == "DEAD" ~ 1,
+      str_to_upper(vital_status) == "ALIVE" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    os_days = case_when(
+      os_event == 1 ~ days_to_death,
+      os_event == 0 ~ days_to_last_follow_up,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    !is.na(age_years),
+    age_years <= 21,
+    !is.na(os_event)
+  )
+
+target_meta %>%
+  mutate(missing_os_days = is.na(os_days)) %>%
+  dplyr::count(vital_status, os_event, missing_os_days)
+
+```
+
+```{r}
+target_meta_surv <- target_meta %>%
+  filter(!is.na(os_days))
+
+target_meta_surv %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patient_id),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE)
+  )
+```
+
+```{r}
+target_cd24 <- target_meta_surv %>%
+  inner_join(target_cd24_expr, by = "sample_id") %>%
+  filter(!is.na(CD24_expr)) %>%
+  mutate(
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High",
+      "CD24 Low"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low", "CD24 High")
+    )
+  )
+
+target_cd24 %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patient_id),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE)
+  )
+
+table(target_cd24$CD24_group)
+```
+
+```{r}
+target_cd24_wilcox <- wilcox.test(
+  os_days ~ CD24_group,
+  data = target_cd24
+)
+
+target_cd24_wilcox
+```
+
+```{r}
+target_cd24_spearman <- cor.test(
+  target_cd24$CD24_expr,
+  target_cd24$os_days,
+  method = "spearman"
+)
+
+target_cd24_spearman
+```
+
+#### KM for Target Dataset
+
+```{r}
+# TARGET-OS Kaplan-Meier-style curve with labeled risk table rows
+# Converted from days to months for consistent axis labeling.
+
+library(survival)
+library(survminer)
+
+# Make sure CD24 group labels are clean and convert days to months
+target_cd24 <- target_cd24 %>%
+  mutate(
+    os_months = os_days / 30.44,
+    CD24_group = case_when(
+      str_detect(as.character(CD24_group), "Low") ~ "CD24 Low tumors",
+      str_detect(as.character(CD24_group), "High") ~ "CD24 High tumors",
+      TRUE ~ as.character(CD24_group)
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+# Fit survival curve
+target_cd24_fit <- survfit(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = target_cd24
+)
+
+# Log-rank test
+target_cd24_logrank <- survdiff(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = target_cd24
+)
+
+target_cd24_logrank_p <- 1 - pchisq(
+  target_cd24_logrank$chisq,
+  df = length(target_cd24_logrank$n) - 1
+)
+
+# KM-style plot with labeled risk table
+target_cd24_km <- ggsurvplot(
+  target_cd24_fit,
+  data = target_cd24,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.35,
+  pval = paste0("Log-rank p = ", signif(target_cd24_logrank_p, 3)),
+  pval.coord = c(80, 0.90),
+  conf.int = FALSE,
+  palette = c("black", "#FF1493"),
+  legend.title = "",
+  legend.labs = c(
+    "CD24 Low tumors",
+    "CD24 High tumors"
+  ),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  ggtheme = theme_classic(base_size = 16),
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = FALSE,
+  risk.table.fontsize = 5,
+  tables.theme = theme_classic(base_size = 15)
+)
+
+# Format main KM plot
+target_cd24_km$plot <- target_cd24_km$plot +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 15),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 20)
+  )
+
+# Format risk table so labels show clearly
+target_cd24_km$table <- target_cd24_km$table +
+  labs(x = "Overall Survival (Months)") +
+  theme(
+    plot.title = element_text(size = 18, hjust = 0),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(
+      size = 14,
+      color = c("black", "#FF1493")
+    ),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 100)
+  )
+
+target_cd24_km
+
+# Save figure
+png(
+  "TARGET_OS_pediatric_CD24_KM_risk_table_months_labeled_axes.png",
+  width = 2000,
+  height = 1500,
+  res = 200
+)
+
+print(target_cd24_km)
+
+dev.off()
+
+# Print p-value
+target_cd24_logrank_p
+```
+
+### TARGET-OS/Xena Subtype Check:
+
+```{r}
+# TARGET-OS/Xena subtype and clinical feature check
+# This is separate from the main KM filtering chunk.
+
+target_subtype_check <- target_clinical %>%
+  transmute(
+    sample_id = sample,
+    patient_id = submitter_id,
+    vital_status = as.character(`vital_status.demographic`),
+    age_years = as.numeric(
+      `age_at_earliest_diagnosis_in_years.diagnoses.xena_derived`
+    ),
+    days_to_death = as.numeric(`days_to_death.demographic`),
+    days_to_last_follow_up = as.numeric(`days_to_last_follow_up.diagnoses`),
+    primary_diagnosis = `primary_diagnosis.diagnoses`,
+    metastasis_at_diagnosis = `metastasis_at_diagnosis.diagnoses`,
+    tumor_grade = `tumor_grade.diagnoses`,
+    classification_of_tumor = `classification_of_tumor.diagnoses`,
+    site_of_resection_or_biopsy = `site_of_resection_or_biopsy.diagnoses`,
+    tissue_or_organ_of_origin = `tissue_or_organ_of_origin.diagnoses`,
+    sample_type = `sample_type.samples`,
+    tissue_type = `tissue_type.samples`
+  ) %>%
+  mutate(
+    os_event = case_when(
+      str_to_upper(vital_status) == "DEAD" ~ 1,
+      str_to_upper(vital_status) == "ALIVE" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    os_days = case_when(
+      os_event == 1 ~ days_to_death,
+      os_event == 0 ~ days_to_last_follow_up,
+      TRUE ~ NA_real_
+    ),
+    age_group = case_when(
+      age_years <= 18 ~ "<=18",
+      age_years <= 21 ~ "19-21",
+      age_years > 21 ~ ">21",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(
+    !is.na(age_years),
+    age_years <= 21
+  ) %>%
+  inner_join(target_cd24_expr, by = "sample_id") %>%
+  filter(!is.na(CD24_expr))
+
+target_subtype_check %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patient_id),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE),
+    deaths = sum(os_event == 1, na.rm = TRUE),
+    alive_censored = sum(os_event == 0, na.rm = TRUE),
+    usable_survival_time = sum(!is.na(os_days))
+  )
+
+target_subtype_check %>%
+  dplyr::count(age_group)
+
+target_subtype_check %>%
+  dplyr::count(metastasis_at_diagnosis, sort = TRUE)
+
+target_subtype_check %>%
+  dplyr::count(primary_diagnosis, sort = TRUE)
+
+target_subtype_check %>%
+  dplyr::count(classification_of_tumor, sort = TRUE)
+
+target_subtype_check %>%
+  dplyr::count(site_of_resection_or_biopsy, sort = TRUE)
+```
+
+```{r}
+##### TARGET-OS CD24 Group + Metastasis Subgroup Check
+
+target_cd24_metastasis <- target_subtype_check %>%
+  filter(
+    !is.na(age_years),
+    age_years <= 21,
+    metastasis_at_diagnosis %in% c("No Metastasis", "Metastasis, NOS"),
+    !is.na(os_days),
+    !is.na(os_event),
+    !is.na(CD24_expr)
+  ) %>%
+  mutate(
+    os_months = os_days / 30.44,
+    
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High tumors",
+      "CD24 Low tumors"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    ),
+    
+    metastasis_group = case_when(
+      metastasis_at_diagnosis == "No Metastasis" ~ "No metastasis",
+      metastasis_at_diagnosis == "Metastasis, NOS" ~ "Metastasis at diagnosis",
+      TRUE ~ NA_character_
+    ),
+    metastasis_group = factor(
+      metastasis_group,
+      levels = c("No metastasis", "Metastasis at diagnosis")
+    )
+  )
+
+target_cd24_metastasis %>%
+  dplyr::count(CD24_group, metastasis_group)
+
+target_cd24_metastasis %>%
+  group_by(CD24_group, metastasis_group) %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patient_id),
+    deaths = sum(os_event == 1, na.rm = TRUE),
+    alive_censored = sum(os_event == 0, na.rm = TRUE),
+    median_os_months = median(os_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#### TARGET-OS CD24 Low: Survival by Metastasis at Diagnosis
+
+target_low_metastasis <- target_cd24_metastasis %>%
+  filter(CD24_group == "CD24 Low tumors")
+
+target_low_metastasis %>%
+  dplyr::count(metastasis_group)
+
+target_low_meta_fit <- survfit(
+  Surv(os_months, os_event) ~ metastasis_group,
+  data = target_low_metastasis
+)
+
+target_low_meta_logrank <- survdiff(
+  Surv(os_months, os_event) ~ metastasis_group,
+  data = target_low_metastasis
+)
+
+target_low_meta_p <- 1 - pchisq(
+  target_low_meta_logrank$chisq,
+  df = length(target_low_meta_logrank$n) - 1
+)
+
+target_low_meta_km <- ggsurvplot(
+  target_low_meta_fit,
+  data = target_low_metastasis,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.35,
+  pval = paste0("Log-rank p = ", signif(target_low_meta_p, 3)),
+pval.coord = c(75, 0.90),
+  conf.int = FALSE,
+  palette = c("black", "#FF1493"),
+  legend.title = "",
+  legend.labs = c("No metastasis", "Metastasis at diagnosis"),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  ggtheme = theme_classic(base_size = 16),
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = FALSE,
+  risk.table.fontsize = 5,
+  tables.theme = theme_classic(base_size = 15)
+)
+
+target_low_meta_km$table <- target_low_meta_km$table +
+  scale_y_discrete(labels = c("No metastasis", "Metastasis at diagnosis")) +
+  labs(x = "Overall Survival (Months)") +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(
+      size = 14,
+      color = c("black", "#FF1493")
+    ),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 120)
+  )
+
+target_low_meta_km
+
+png(
+  "TARGET_OS_CD24_low_metastasis_KM_age21under.png",
+  width = 2200,
+  height = 1600,
+  res = 200
+)
+
+print(target_low_meta_km)
+
+dev.off()
+
+target_low_meta_p
+```
+
+```{r}
+#### TARGET-OS CD24 High: Survival by Metastasis at Diagnosis
+
+target_high_metastasis <- target_cd24_metastasis %>%
+  filter(CD24_group == "CD24 High tumors")
+
+target_high_metastasis %>%
+  dplyr::count(metastasis_group)
+
+target_high_meta_fit <- survfit(
+  Surv(os_months, os_event) ~ metastasis_group,
+  data = target_high_metastasis
+)
+
+target_high_meta_logrank <- survdiff(
+  Surv(os_months, os_event) ~ metastasis_group,
+  data = target_high_metastasis
+)
+
+target_high_meta_p <- 1 - pchisq(
+  target_high_meta_logrank$chisq,
+  df = length(target_high_meta_logrank$n) - 1
+)
+
+target_high_meta_km <- ggsurvplot(
+  target_high_meta_fit,
+  data = target_high_metastasis,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.35,
+  pval = paste0("Log-rank p = ", signif(target_high_meta_p, 3)),
+pval.coord = c(75, 0.90),
+  conf.int = FALSE,
+  palette = c("black", "#FF1493"),
+  legend.title = "",
+  legend.labs = c("No metastasis", "Metastasis at diagnosis"),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  ggtheme = theme_classic(base_size = 16),
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = FALSE,
+  risk.table.fontsize = 5,
+  tables.theme = theme_classic(base_size = 15)
+)
+
+target_high_meta_km$table <- target_high_meta_km$table +
+  scale_y_discrete(labels = c("No metastasis", "Metastasis at diagnosis")) +
+  labs(x = "Overall Survival (Months)") +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(
+      size = 14,
+      color = c("black", "#FF1493")
+    ),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 120)
+  )
+
+target_high_meta_km
+
+png(
+  "TARGET_OS_CD24_high_metastasis_KM_age21under.png",
+  width = 2200,
+  height = 1600,
+  res = 200
+)
+
+print(target_high_meta_km)
+
+dev.off()
+
+target_high_meta_p
+```
+
+### Loading in Openpedcan:
+
+```{r}
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+library(survival)
+library(survminer)
+
+base_url <- "https://cbioportal-api.ccdi.cancer.gov/api"
+study_id <- "openpedcan_v15"
+
+expr_profile_id <- "openpedcan_v15_rna_seq_v2_mrna"
+sample_list_id <- "openpedcan_v15_rna_seq_v2_mrna"
+```
+
+```{r}
+cd24_entrez <- 100133941
+
+cd24_expr <- request(
+  paste0(
+    base_url,
+    "/molecular-profiles/",
+    expr_profile_id,
+    "/molecular-data/fetch"
+  )
+) %>%
+  req_method("POST") %>%
+  req_body_json(
+    list(
+      entrezGeneIds = list(cd24_entrez),
+      sampleListId = sample_list_id
+    )
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+cd24_expr_clean <- cd24_expr %>%
+  transmute(
+    sampleId = sampleId,
+    patientId = patientId,
+    CD24_expr = as.numeric(value)
+  ) %>%
+  filter(!is.na(CD24_expr))
+
+head(cd24_expr_clean)
+summary(cd24_expr_clean$CD24_expr)
+nrow(cd24_expr_clean)
+```
+
+```{r}
+# Pull OpenPedCan clinical data
+
+openped_clinical_sample <- request(
+  paste0(base_url, "/studies/", study_id, "/clinical-data")
+) %>%
+  req_url_query(
+    clinicalDataType = "SAMPLE",
+    projection = "DETAILED"
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+openped_clinical_patient <- request(
+  paste0(base_url, "/studies/", study_id, "/clinical-data")
+) %>%
+  req_url_query(
+    clinicalDataType = "PATIENT",
+    projection = "DETAILED"
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+# Make sample clinical table wide
+openped_clinical_sample_wide <- openped_clinical_sample %>%
+  select(sampleId, patientId, clinicalAttributeId, value) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = clinicalAttributeId,
+    values_from = value,
+    values_fn = list(value = dplyr::first)
+  )
+
+# Make patient clinical table wide
+openped_clinical_patient_wide <- openped_clinical_patient %>%
+  select(patientId, clinicalAttributeId, value) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = clinicalAttributeId,
+    values_from = value,
+    values_fn = list(value = dplyr::first)
+  )
+
+# Merge sample + patient clinical metadata
+openped_clinical <- openped_clinical_sample_wide %>%
+  left_join(
+    openped_clinical_patient_wide,
+    by = "patientId"
+  )
+
+# Check survival and cancer columns
+colnames(openped_clinical)[
+  str_detect(
+    colnames(openped_clinical),
+    regex(
+      "OS|SURV|DEATH|VITAL|STATUS|MONTH|DAYS|CANCER|DIAG|TUMOR",
+      ignore_case = TRUE
+    )
+  )
+]
+```
+
+#### \[OPEN PEDCAN\] Filter to Osteosarcoma & filter age:
+
+```{r}
+# Merge CD24 expression with OpenPedCan clinical metadata
+openped_cd24_surv <- cd24_expr_clean %>%
+  left_join(openped_clinical, by = c("sampleId", "patientId"))
+
+# Filter to age 21 and under first
+openped_cd24_surv_21_under <- openped_cd24_surv %>%
+  mutate(
+    age_years = as.numeric(AGE)
+  ) %>%
+  filter(
+    !is.na(age_years),
+    age_years <= 21
+  )
+
+# Check age-filtered dataset
+openped_cd24_surv_21_under %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE)
+  )
+```
+
+```{r}
+# Filter age 21-and-under OpenPedCan data to osteosarcoma only
+openped_osteo_cd24 <- openped_cd24_surv_21_under %>%
+  mutate(
+    cancer_type = CANCER_TYPE_DETAILED,
+    os_months = as.numeric(OS_MONTHS),
+    os_event = case_when(
+      str_detect(str_to_upper(OS_STATUS), "DECEASED|DEAD|1:") ~ 1,
+      str_detect(str_to_upper(OS_STATUS), "LIVING|ALIVE|0:") ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    str_detect(cancer_type, regex("osteosarcoma", ignore_case = TRUE)),
+    !is.na(CD24_expr),
+    !is.na(os_months),
+    !is.na(os_event)
+  )
+
+# Check final osteosarcoma survival dataset
+openped_osteo_cd24 %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    median_CD24 = median(CD24_expr, na.rm = TRUE)
+  )
+
+table(openped_osteo_cd24$cancer_type)
+table(openped_osteo_cd24$os_event)
+```
+
+#### \[open pedcan\] Split CD24 High & Low :
+
+```{r}
+# Create CD24 High vs Low groups using median CD24 expression
+
+openped_osteo_cd24 <- openped_osteo_cd24 %>%
+  mutate(
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High",
+      "CD24 Low"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low", "CD24 High")
+    )
+  )
+
+# Check group sizes
+openped_osteo_cd24 %>%
+  dplyr::count(CD24_group)
+
+# Check survival and age summary by group
+openped_osteo_cd24 %>%
+  group_by(CD24_group) %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE),
+    median_os_months = median(os_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#### OpenPedCan Osteosarcoma: CD24 KM
+#### Low = black, High = pink
+#### Age <= 21 only
+
+library(dplyr)
+library(stringr)
+library(survival)
+library(survminer)
+library(ggplot2)
+
+# Prepare KM data
+openped_osteo_cd24 <- openped_osteo_cd24 %>%
+  filter(
+    !is.na(age_years),
+    age_years <= 21,
+    !is.na(CD24_expr),
+    !is.na(os_months),
+    !is.na(os_event)
+  ) %>%
+  mutate(
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High tumors",
+      "CD24 Low tumors"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+# Check that CD24 High really has higher expression
+openped_osteo_cd24 %>%
+  group_by(CD24_group) %>%
+  summarise(
+    n = n(),
+    n_patients = n_distinct(patientId),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    min_CD24 = min(CD24_expr, na.rm = TRUE),
+    max_CD24 = max(CD24_expr, na.rm = TRUE),
+    deaths = sum(os_event == 1, na.rm = TRUE),
+    alive_censored = sum(os_event == 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Fit KM curve
+openped_osteo_fit <- survfit(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openped_osteo_cd24
+)
+
+# Check strata order
+names(openped_osteo_fit$strata)
+
+# Log-rank test
+openped_osteo_logrank <- survdiff(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openped_osteo_cd24
+)
+
+openped_osteo_logrank_p <- 1 - pchisq(
+  openped_osteo_logrank$chisq,
+  df = length(openped_osteo_logrank$n) - 1
+)
+
+# KM plot
+# Factor order is Low, High
+# Therefore palette order is black, pink
+openped_osteo_km <- ggsurvplot(
+  openped_osteo_fit,
+  data = openped_osteo_cd24,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.35,
+  pval = paste0("Log-rank p = ", signif(openped_osteo_logrank_p, 3)),
+  pval.coord = c(5, 0.12),
+  conf.int = FALSE,
+  palette = c("black", "#FF1493"),
+  legend.title = "",
+  legend.labs = c(
+    "CD24 Low tumors",
+    "CD24 High tumors"
+  ),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  ggtheme = theme_classic(base_size = 16),
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = TRUE,
+  risk.table.fontsize = 5,
+  tables.theme = theme_classic(base_size = 15)
+)
+
+# Only adjust spacing/axis size.
+# Do NOT manually recolor or relabel the risk table.
+openped_osteo_km$table <- openped_osteo_km$table +
+  labs(x = "Overall Survival (Months)") +
+  theme(
+    plot.title = element_text(size = 18, hjust = 0),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 14),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 120)
+  )
+
+openped_osteo_km
+
+# Save figure
+png(
+  "OpenPedCan_osteosarcoma_age21under_CD24_KM_risk_table_labeled.png",
+  width = 2200,
+  height = 1600,
+  res = 200
+)
+
+print(openped_osteo_km)
+
+dev.off()
+
+# Print p-value
+openped_osteo_logrank_p
+
+# Optional: directly verify risk table values
+osteo_km_check <- summary(
+  openped_osteo_fit,
+  times = c(0, 50, 100, 150, 200)
+)
+
+data.frame(
+  strata = osteo_km_check$strata,
+  time = osteo_km_check$time,
+  n_risk = osteo_km_check$n.risk,
+  n_event = osteo_km_check$n.event,
+  n_censor = osteo_km_check$n.censor
+)
+```
+
+```{r}
+km_check <- summary(openped_osteo_fit, times = c(0, 50, 100, 150, 200))
+
+data.frame(
+  strata = km_check$strata,
+  time = km_check$time,
+  n_risk = km_check$n.risk,
+  n_event = km_check$n.event,
+  n_censor = km_check$n.censor
+)
+```
+
+#### \[Open Pedcan\] Correlation analysis:
+
+```{r}
+# Cox Model
+openped_osteo_cox <- coxph(
+  Surv(os_months, os_event) ~ CD24_expr,
+  data = openped_osteo_cd24
+)
+
+summary(openped_osteo_cox)
+```
+
+```{r}
+# Pearson correlation
+openped_osteo_pearson <- cor.test(
+  openped_osteo_cd24$CD24_expr,
+  openped_osteo_cd24$os_months,
+  method = "pearson"
+)
+
+# Spearman correlation
+openped_osteo_spearman <- cor.test(
+  openped_osteo_cd24$CD24_expr,
+  openped_osteo_cd24$os_months,
+  method = "spearman"
+)
+
+openped_osteo_pearson
+openped_osteo_spearman
+```
+
+### OpenPedCan ewing's sarcoma:
+
+```{r}
+#### OpenPedCan Ewing Sarcoma: Merge CD24 + Clinical, Age <= 21
+
+openped_ewing_cd24 <- openped_cd24_surv %>%
+  mutate(
+    age_years = as.numeric(AGE),
+    cancer_type = CANCER_TYPE_DETAILED,
+    os_months = as.numeric(OS_MONTHS),
+    os_event = case_when(
+      str_detect(str_to_upper(OS_STATUS), "DECEASED|DEAD|1:") ~ 1,
+      str_detect(str_to_upper(OS_STATUS), "LIVING|ALIVE|0:") ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    str_detect(cancer_type, regex("ewing|ews", ignore_case = TRUE)),
+    !is.na(age_years),
+    age_years <= 21,
+    !is.na(CD24_expr),
+    !is.na(os_months),
+    !is.na(os_event)
+  )
+
+openped_ewing_cd24 %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE),
+    median_os_months = median(os_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE)
+  )
+
+table(openped_ewing_cd24$cancer_type)
+table(openped_ewing_cd24$os_event)
+```
+
+```{r}
+#### OpenPedCan Ewing Sarcoma: CD24 High vs Low
+
+openped_ewing_cd24 <- openped_ewing_cd24 %>%
+  mutate(
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High tumors",
+      "CD24 Low tumors"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+openped_ewing_cd24 %>%
+  dplyr::count(CD24_group)
+
+openped_ewing_cd24 %>%
+  group_by(CD24_group) %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    median_age = median(age_years, na.rm = TRUE),
+    median_os_months = median(os_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#### OpenPedCan Ewing Sarcoma: CD24 High vs Low KM
+
+ewing_fit <- survfit(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openped_ewing_cd24
+)
+
+ewing_logrank <- survdiff(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openped_ewing_cd24
+)
+
+ewing_logrank_p <- 1 - pchisq(
+  ewing_logrank$chisq,
+  df = length(ewing_logrank$n) - 1
+)
+
+ewing_km <- ggsurvplot(
+  ewing_fit,
+  data = openped_ewing_cd24,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.35,
+  pval = paste0("Log-rank p = ", signif(ewing_logrank_p, 3)),
+  pval.coord = c(10, 0.10),
+  conf.int = FALSE,
+  palette = c("black", "#FF1493"),
+  legend.title = "",
+  legend.labs = c(
+    "CD24 Low tumors",
+    "CD24 High tumors"
+  ),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  ggtheme = theme_classic(base_size = 16),
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = FALSE,
+  risk.table.fontsize = 5,
+  tables.theme = theme_classic(base_size = 15)
+)
+
+ewing_km$table <- ewing_km$table +
+  scale_y_discrete(
+    labels = c("CD24 Low tumors", "CD24 High tumors")
+  ) +
+  labs(x = "Overall Survival (Months)") +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(
+      size = 14,
+      color = c("black", "#FF1493")
+    ),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 120)
+  )
+
+ewing_km
+
+png(
+  "OpenPedCan_ewing_sarcoma_CD24_KM_age21under.png",
+  width = 2200,
+  height = 1600,
+  res = 200
+)
+
+print(ewing_km)
+
+dev.off()
+
+ewing_logrank_p
+```
+
+```{r}
+#### OpenPedCan Ewing Sarcoma: CD24 Correlation with OS
+
+ewing_pearson <- cor.test(
+  openped_ewing_cd24$CD24_expr,
+  openped_ewing_cd24$os_months,
+  method = "pearson"
+)
+
+ewing_spearman <- cor.test(
+  openped_ewing_cd24$CD24_expr,
+  openped_ewing_cd24$os_months,
+  method = "spearman"
+)
+
+ewing_pearson
+ewing_spearman
+```
+
+### Loading in GSE21257 Data set:
+
+```{r}
+library(tidyverse)
+library(limma)
+library(GEOquery)
+
+gse_list <- getGEO(
+  "GSE21257",
+  GSEMatrix = TRUE
+)
+
+gse21257 <- gse_list[[1]]
+
+gse_expr <- exprs(gse21257)
+gse_pheno <- pData(gse21257)
+gse_feature <- fData(gse21257)
+
+dim(gse_expr)
+dim(gse_pheno)
+dim(gse_feature)
+
+head(gse_expr[, 1:5])
+head(gse_pheno)
+head(gse_feature)
+```
+
+```{r}
+colnames(gse_pheno)
+
+gse_pheno %>%
+  select(starts_with("characteristics")) %>%
+  head()
+```
+
+```{r}
+colnames(gse_pheno)[
+  str_detect(
+    colnames(gse_pheno),
+    regex(
+      "metast|surv|death|status|follow|event|time|years|outcome",
+      ignore_case = TRUE
+    )
+  )
+]
+```
+
+```{r}
+
+
+table(gse_pheno$`status:ch1`, useNA = "ifany")
+
+gse_pheno %>%
+  select(title, geo_accession, `status:ch1`, characteristics_ch1, characteristics_ch1.1) %>%
+  head(20)
+```
+
+```{r}
+# Build GSE21257 survival metadata from status:ch1
+
+gse_meta_surv <- gse_pheno %>%
+  rownames_to_column("sample_id") %>%
+  transmute(
+    sample_id = sample_id,
+    geo_accession = geo_accession,
+    title = title,
+    age_months = as.numeric(str_extract(characteristics_ch1, "\\d+")),
+    age_years = age_months / 12,
+    gender = str_remove(characteristics_ch1.1, "gender: "),
+    survival_status_text = as.character(`status:ch1`)
+  ) %>%
+  mutate(
+    survival_event = case_when(
+      str_detect(str_to_lower(survival_status_text), "deceased") ~ 1,
+      str_detect(str_to_lower(survival_status_text), "alive") ~ 0,
+      TRUE ~ NA_real_
+    ),
+    survival_months = as.numeric(
+      str_extract(survival_status_text, "\\d+")
+    )
+  ) %>%
+  filter(
+    !is.na(age_years),
+    age_years <= 21,
+    !is.na(survival_months),
+    !is.na(survival_event)
+  )
+
+gse_meta_surv %>%
+  summarise(
+    n_samples = n(),
+    deaths = sum(survival_event == 1),
+    alive_censored = sum(survival_event == 0),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE),
+    min_survival_months = min(survival_months, na.rm = TRUE),
+    median_survival_months = median(survival_months, na.rm = TRUE),
+    max_survival_months = max(survival_months, na.rm = TRUE)
+  )
+
+table(gse_meta_surv$survival_event)
+```
+
+```{r}
+# Find CD24
+
+gse_cd24_features <- gse_feature %>%
+  rownames_to_column("probe_id") %>%
+  filter(
+    if_any(
+      everything(),
+      ~ str_detect(as.character(.x), regex("^CD24$|CD24", ignore_case = FALSE))
+    )
+  )
+
+gse_cd24_features
+```
+
+```{r}
+# Extract CD24 expression from GSE21257
+
+gse_cd24_probe_ids <- gse_cd24_features$probe_id
+
+gse_cd24_mat <- gse_expr[
+  gse_cd24_probe_ids,
+  ,
+  drop = FALSE
+]
+
+# If multiple probes map to CD24, average them
+gse_cd24_expr <- tibble(
+  sample_id = colnames(gse_expr),
+  CD24_expr = colMeans(gse_cd24_mat, na.rm = TRUE)
+)
+
+head(gse_cd24_expr)
+summary(gse_cd24_expr$CD24_expr)
+```
+
+```{r}
+# Merge CD24 expression with GSE21257 survival metadata
+
+gse_cd24_surv <- gse_meta_surv %>%
+  inner_join(gse_cd24_expr, by = "sample_id") %>%
+  filter(!is.na(CD24_expr)) %>%
+  mutate(
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High",
+      "CD24 Low"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low", "CD24 High")
+    )
+  )
+
+gse_cd24_surv %>%
+  summarise(
+    n_samples = n(),
+    deaths = sum(survival_event == 1),
+    alive_censored = sum(survival_event == 0),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE)
+  )
+
+gse_cd24_surv %>%
+  dplyr::count(CD24_group)
+
+gse_cd24_surv %>%
+  group_by(CD24_group) %>%
+  summarise(
+    n_samples = n(),
+    deaths = sum(survival_event == 1),
+    alive_censored = sum(survival_event == 0),
+    median_survival_months = median(survival_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+#### KM for GSE21257 data set:
+
+```{r}
+# GSE21257 osteosarcoma KM curve with labeled risk table rows
+# CD24 High vs Low
+
+library(survival)
+library(survminer)
+
+# Make sure CD24 group labels are clean BEFORE fitting survival curve
+gse_cd24_surv <- gse_cd24_surv %>%
+  mutate(
+    CD24_group = case_when(
+      str_detect(as.character(CD24_group), "Low") ~ "CD24 Low tumors",
+      str_detect(as.character(CD24_group), "High") ~ "CD24 High tumors",
+      TRUE ~ as.character(CD24_group)
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+# Fit survival curve
+gse_cd24_fit <- survfit(
+  Surv(survival_months, survival_event) ~ CD24_group,
+  data = gse_cd24_surv
+)
+
+# Log-rank test
+gse_cd24_logrank <- survdiff(
+  Surv(survival_months, survival_event) ~ CD24_group,
+  data = gse_cd24_surv
+)
+
+gse_cd24_logrank_p <- 1 - pchisq(
+  gse_cd24_logrank$chisq,
+  df = length(gse_cd24_logrank$n) - 1
+)
+
+# Kaplan-Meier plot with labeled risk table
+gse_cd24_km <- ggsurvplot(
+  gse_cd24_fit,
+  data = gse_cd24_surv,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.35,
+  pval = paste0("Log-rank p = ", signif(gse_cd24_logrank_p, 3)),
+  pval.coord = c(5, 0.12),
+  conf.int = FALSE,
+  palette = c("black", "#FF1493"),
+  legend.title = "",
+  legend.labs = c(
+    "CD24 Low tumors",
+    "CD24 High tumors"
+  ),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  ggtheme = theme_classic(base_size = 16),
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = FALSE,
+  risk.table.fontsize = 5,
+  tables.theme = theme_classic(base_size = 15)
+)
+
+# Force full risk table labels and color them
+gse_cd24_km$table <- gse_cd24_km$table +
+  scale_y_discrete(
+    labels = c(
+      "CD24 Low tumors",
+      "CD24 High tumors"
+    )
+  ) +
+  labs(x = "Overall Survival (Months)") +
+  theme(
+    plot.title = element_text(size = 18, hjust = 0),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(
+      size = 14,
+      color = c("black", "#FF1493")
+    ),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 120)
+  )
+
+gse_cd24_km
+
+# Save figure
+png(
+  "GSE21257_osteosarcoma_CD24_KM_risk_table_labeled.png",
+  width = 2200,
+  height = 1600,
+  res = 200
+)
+
+print(gse_cd24_km)
+
+dev.off()
+
+gse_cd24_logrank_p
+```
+
+#### Correlation analysis GSE21257:
+
+```{r}
+# Cox model
+
+gse_cd24_cox <- coxph(
+  Surv(survival_months, survival_event) ~ CD24_expr,
+  data = gse_cd24_surv
+)
+
+summary(gse_cd24_cox)
+```
+
+```{r}
+# Pearson correlation
+gse_cd24_pearson <- cor.test(
+  gse_cd24_surv$CD24_expr,
+  gse_cd24_surv$survival_months,
+  method = "pearson"
+)
+
+# Spearman correlation
+gse_cd24_spearman <- cor.test(
+  gse_cd24_surv$CD24_expr,
+  gse_cd24_surv$survival_months,
+  method = "spearman"
+)
+
+gse_cd24_pearson
+gse_cd24_spearman
+```

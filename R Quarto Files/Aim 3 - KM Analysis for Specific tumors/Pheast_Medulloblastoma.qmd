@@ -1,0 +1,877 @@
+---
+title: "Pheast_Medulloblastoma"
+format: html
+editor: visual
+---
+
+## Loading in Data set
+
+```{r}
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+library(survival)
+library(survminer)
+
+base_url <- "https://cbioportal-api.ccdi.cancer.gov/api"
+study_id <- "openpedcan_v15"
+
+expr_profile_id <- "openpedcan_v15_rna_seq_v2_mrna"
+sample_list_id <- "openpedcan_v15_rna_seq_v2_mrna"
+```
+
+```{r}
+#### Pull CD24 expression from OpenPedCan
+
+cd24_entrez <- 100133941
+
+cd24_expr <- request(
+  paste0(
+    base_url,
+    "/molecular-profiles/",
+    expr_profile_id,
+    "/molecular-data/fetch"
+  )
+) %>%
+  req_method("POST") %>%
+  req_body_json(
+    list(
+      entrezGeneIds = list(cd24_entrez),
+      sampleListId = sample_list_id
+    )
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+cd24_expr_clean <- cd24_expr %>%
+  transmute(
+    sampleId = sampleId,
+    patientId = patientId,
+    CD24_expr = as.numeric(value)
+  ) %>%
+  filter(!is.na(CD24_expr))
+
+head(cd24_expr_clean)
+summary(cd24_expr_clean$CD24_expr)
+nrow(cd24_expr_clean)
+```
+
+```{r}
+#### Pull OpenPedCan clinical data
+
+openped_clinical_sample <- request(
+  paste0(base_url, "/studies/", study_id, "/clinical-data")
+) %>%
+  req_url_query(
+    clinicalDataType = "SAMPLE",
+    projection = "DETAILED"
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+openped_clinical_patient <- request(
+  paste0(base_url, "/studies/", study_id, "/clinical-data")
+) %>%
+  req_url_query(
+    clinicalDataType = "PATIENT",
+    projection = "DETAILED"
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+openped_clinical_sample_wide <- openped_clinical_sample %>%
+  select(sampleId, patientId, clinicalAttributeId, value) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = clinicalAttributeId,
+    values_from = value,
+    values_fn = list(value = dplyr::first)
+  )
+
+openped_clinical_patient_wide <- openped_clinical_patient %>%
+  select(patientId, clinicalAttributeId, value) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = clinicalAttributeId,
+    values_from = value,
+    values_fn = list(value = dplyr::first)
+  )
+
+openped_clinical <- openped_clinical_sample_wide %>%
+  left_join(
+    openped_clinical_patient_wide,
+    by = "patientId"
+  )
+
+colnames(openped_clinical)[
+  str_detect(
+    colnames(openped_clinical),
+    regex("AGE|OS|SURV|DEATH|VITAL|STATUS|MONTH|CANCER|DIAG", ignore_case = TRUE)
+  )
+]
+```
+
+```{r}
+#### OpenPedCan Medulloblastoma: Merge CD24 + Clinical
+
+openped_cd24_surv <- cd24_expr_clean %>%
+  left_join(openped_clinical, by = c("sampleId", "patientId"))
+
+openped_medullo_cd24 <- openped_cd24_surv %>%
+  mutate(
+    age_years = as.numeric(AGE),
+    cancer_type = CANCER_TYPE_DETAILED,
+    os_months = as.numeric(OS_MONTHS),
+    os_event = case_when(
+      str_detect(str_to_upper(OS_STATUS), "DECEASED|DEAD|1:") ~ 1,
+      str_detect(str_to_upper(OS_STATUS), "LIVING|ALIVE|0:") ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    str_detect(cancer_type, regex("medulloblastoma", ignore_case = TRUE)),
+    !is.na(age_years),
+    age_years <= 21,
+    !is.na(CD24_expr),
+    !is.na(os_months),
+    !is.na(os_event)
+  )
+
+openped_medullo_cd24 %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE),
+    median_os_months = median(os_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE)
+  )
+
+table(openped_medullo_cd24$cancer_type)
+table(openped_medullo_cd24$os_event)
+```
+
+#### Filter:
+
+```{r}
+#### OpenPedCan Medulloblastoma: Merge CD24 + Clinical (Age <= 21 only)
+
+openped_cd24_surv <- cd24_expr_clean %>%
+  left_join(openped_clinical, by = c("sampleId", "patientId"))
+
+openped_medullo_cd24 <- openped_cd24_surv %>%
+  mutate(
+    age_years = suppressWarnings(as.numeric(AGE)),
+    
+    cancer_type = CANCER_TYPE_DETAILED,
+    
+    os_months = suppressWarnings(as.numeric(OS_MONTHS)),
+    
+    os_event = case_when(
+      str_detect(str_to_upper(OS_STATUS), "DECEASED|DEAD|1:") ~ 1,
+      str_detect(str_to_upper(OS_STATUS), "LIVING|ALIVE|0:") ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    str_detect(
+      cancer_type,
+      regex("medulloblastoma", ignore_case = TRUE)
+    ),
+    
+    !is.na(age_years),
+    age_years <= 21,
+    
+    !is.na(CD24_expr),
+    !is.na(os_months),
+    !is.na(os_event)
+  )
+
+openped_medullo_cd24 %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    mean_age = mean(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE),
+    
+    median_os_months = median(os_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE)
+  )
+
+openped_medullo_cd24 %>%
+  arrange(desc(age_years)) %>%
+  select(
+    sampleId,
+    patientId,
+    age_years,
+    cancer_type,
+    os_months,
+    os_event,
+    CD24_expr
+  ) %>%
+  head(20)
+```
+
+```{r}
+#### OpenPedCan Medulloblastoma: CD24 High vs Low
+
+openped_medullo_cd24 <- openped_medullo_cd24 %>%
+  mutate(
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High tumors",
+      "CD24 Low tumors"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+openped_medullo_cd24 %>%
+  dplyr::count(CD24_group)
+
+openped_medullo_cd24 %>%
+  group_by(CD24_group) %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    median_age = median(age_years, na.rm = TRUE),
+    median_os_months = median(os_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#### OpenPedCan Medulloblastoma: CD24 KM
+#### Simple version: no switching/reordering tricks
+
+library(dplyr)
+library(survival)
+library(survminer)
+
+# Recreate CD24 groups directly from expression
+openped_medullo_cd24 <- openped_medullo_cd24 %>%
+  mutate(
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High tumors",
+      "CD24 Low tumors"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+# Check that the grouping is correct
+openped_medullo_cd24 %>%
+  group_by(CD24_group) %>%
+  summarise(
+    n = n(),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    min_CD24 = min(CD24_expr, na.rm = TRUE),
+    max_CD24 = max(CD24_expr, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Fit KM model
+medullo_fit <- survfit(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openped_medullo_cd24
+)
+
+# Log-rank test
+medullo_logrank <- survdiff(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openped_medullo_cd24
+)
+
+medullo_logrank_p <- 1 - pchisq(
+  medullo_logrank$chisq,
+  df = length(medullo_logrank$n) - 1
+)
+
+# Plot
+# Because factor levels are:
+# 1 = CD24 Low tumors
+# 2 = CD24 High tumors
+# palette must be:
+# 1 = black, 2 = pink
+medullo_km <- ggsurvplot(
+  medullo_fit,
+  data = openped_medullo_cd24,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.35,
+  pval = paste0("Log-rank p = ", signif(medullo_logrank_p, 3)),
+  pval.coord = c(10, 0.10),
+  conf.int = FALSE,
+  palette = c("black", "#FF1493"),
+  legend.title = "",
+  legend.labs = c(
+    "CD24 Low tumors",
+    "CD24 High tumors"
+  ),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  ggtheme = theme_classic(base_size = 16),
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = FALSE,
+  risk.table.fontsize = 5,
+  tables.theme = theme_classic(base_size = 15)
+)
+
+medullo_km$table <- medullo_km$table +
+  labs(x = "Overall Survival (Months)") +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 14),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 120)
+  )
+
+medullo_km
+
+# Save
+png(
+  "OpenPedCan_medulloblastoma_CD24_KM_age21under.png",
+  width = 2200,
+  height = 1600,
+  res = 200
+)
+
+print(medullo_km)
+
+dev.off()
+
+medullo_logrank_p
+```
+
+```{r}
+#### OpenPedCan Medulloblastoma: CD24 KM
+#### Low = black, High = pink
+#### Age <= 21 only
+
+library(dplyr)
+library(stringr)
+library(survival)
+library(survminer)
+library(ggplot2)
+
+# Prepare KM data
+openped_medullo_cd24 <- openped_medullo_cd24 %>%
+  filter(
+    !is.na(age_years),
+    age_years <= 21,
+    !is.na(CD24_expr),
+    !is.na(os_months),
+    !is.na(os_event)
+  ) %>%
+  mutate(
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High tumors",
+      "CD24 Low tumors"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+# Check that CD24 High really has higher expression
+openped_medullo_cd24 %>%
+  group_by(CD24_group) %>%
+  summarise(
+    n = n(),
+    n_patients = n_distinct(patientId),
+    median_CD24 = median(CD24_expr, na.rm = TRUE),
+    min_CD24 = min(CD24_expr, na.rm = TRUE),
+    max_CD24 = max(CD24_expr, na.rm = TRUE),
+    deaths = sum(os_event == 1, na.rm = TRUE),
+    alive_censored = sum(os_event == 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Fit KM model
+medullo_fit <- survfit(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openped_medullo_cd24
+)
+
+# Check strata order
+names(medullo_fit$strata)
+
+# Log-rank test
+medullo_logrank <- survdiff(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openped_medullo_cd24
+)
+
+medullo_logrank_p <- 1 - pchisq(
+  medullo_logrank$chisq,
+  df = length(medullo_logrank$n) - 1
+)
+
+# KM plot
+# Factor order is Low, High
+# Therefore palette order is black, pink
+medullo_km <- ggsurvplot(
+  medullo_fit,
+  data = openped_medullo_cd24,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.35,
+  pval = paste0("Log-rank p = ", signif(medullo_logrank_p, 3)),
+  pval.coord = c(10, 0.10),
+  conf.int = FALSE,
+  palette = c("black", "#FF1493"),
+  legend.title = "",
+  legend.labs = c(
+    "CD24 Low tumors",
+    "CD24 High tumors"
+  ),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  ggtheme = theme_classic(base_size = 16),
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = TRUE,
+  risk.table.fontsize = 5,
+  tables.theme = theme_classic(base_size = 15)
+)
+
+# Only adjust spacing/axis size.
+# Do NOT manually recolor or relabel the risk table.
+medullo_km$table <- medullo_km$table +
+  labs(x = "Overall Survival (Months)") +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 14),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 120)
+  )
+
+medullo_km
+
+# Save figure
+png(
+  "OpenPedCan_medulloblastoma_CD24_KM_age21under_2.png",
+  width = 2200,
+  height = 1600,
+  res = 200
+)
+
+print(medullo_km)
+
+dev.off()
+
+# Print p-value
+medullo_logrank_p
+
+# Optional: directly verify risk table values
+medullo_km_check <- summary(
+  medullo_fit,
+  times = c(0, 50, 100, 150, 200, 250)
+)
+
+data.frame(
+  strata = medullo_km_check$strata,
+  time = medullo_km_check$time,
+  n_risk = medullo_km_check$n.risk,
+  n_event = medullo_km_check$n.event,
+  n_censor = medullo_km_check$n.censor
+)
+```
+
+Correlation analysis:
+
+```{r}
+#### OpenPedCan Medulloblastoma: Cox Model
+
+medullo_cox <- coxph(
+  Surv(os_months, os_event) ~ CD24_expr,
+  data = openped_medullo_cd24
+)
+
+summary(medullo_cox)
+```
+
+```{r}
+#### OpenPedCan Medulloblastoma: CD24 Correlation with OS
+
+medullo_pearson <- cor.test(
+  openped_medullo_cd24$CD24_expr,
+  openped_medullo_cd24$os_months,
+  method = "pearson"
+)
+
+medullo_spearman <- cor.test(
+  openped_medullo_cd24$CD24_expr,
+  openped_medullo_cd24$os_months,
+  method = "spearman"
+)
+
+medullo_pearson
+medullo_spearman
+```
+
+```{r}
+#### OpenPedCan Medulloblastoma: CD24 vs OS Scatter Plot
+
+ggplot(
+  openped_medullo_cd24,
+  aes(x = CD24_expr, y = os_months)
+) +
+  geom_point(size = 2.5, alpha = 0.75) +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_classic(base_size = 16) +
+  labs(
+    x = "CD24 Expression",
+    y = "Overall Survival (Months)"
+  )
+
+ggsave(
+  "OpenPedCan_medulloblastoma_CD24_vs_OS_months_age21under.png",
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+```
+
+#### OPENPBTA:
+
+```{r}
+#### List all OpenPBTA files
+
+openpbta_dir <- "openpbta (1)"
+
+openpbta_files <- list.files(
+  openpbta_dir,
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+openpbta_files
+```
+
+```{r}
+#### Load OpenPBTA Expression + Clinical Data
+
+library(tidyverse)
+library(survival)
+library(survminer)
+
+openpbta_dir <- "openpbta (1)"
+
+openpbta_expr <- read_tsv(
+  file.path(
+    openpbta_dir,
+    "data_mrna_expression_continuous_rna_seq_v2_mrna.txt"
+  ),
+  comment = "#"
+)
+
+openpbta_sample_attr <- read_tsv(
+  file.path(
+    openpbta_dir,
+    "data_clinical_sample_attributes.txt"
+  ),
+  comment = "#"
+)
+
+openpbta_patient_attr <- read_tsv(
+  file.path(
+    openpbta_dir,
+    "data_clinical_patient_attributes.txt"
+  ),
+  comment = "#"
+)
+
+dim(openpbta_expr)
+dim(openpbta_sample_attr)
+dim(openpbta_patient_attr)
+```
+
+```{r}
+#### Find clinical files
+
+openpbta_files[
+  str_detect(
+    openpbta_files,
+    regex(
+      "clinical|histolog|metadata|sample|patient|survival",
+      ignore_case = TRUE
+    )
+  )
+]
+```
+
+```{r}
+#### OpenPBTA: Check CD24 Availability
+
+grep(
+  "^CD24$",
+  openpbta_expr$Hugo_Symbol,
+  value = TRUE
+)
+
+openpbta_expr %>%
+  filter(
+    Hugo_Symbol == "CD24"
+  ) %>%
+  select(1:10)
+```
+
+```{r}
+#### OpenPBTA: Extract CD24 Expression
+
+openpbta_cd24_expr <- openpbta_expr %>%
+  filter(
+    Hugo_Symbol == "CD24"
+  ) %>%
+  select(
+    -Hugo_Symbol,
+    -Entrez_Gene_Id
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "sampleId",
+    values_to = "CD24_expr"
+  ) %>%
+  mutate(
+    CD24_expr = as.numeric(CD24_expr)
+  )
+
+openpbta_cd24_expr
+
+summary(openpbta_cd24_expr$CD24_expr)
+```
+
+```{r}
+#### OpenPBTA: Check Clinical Columns
+
+colnames(openpbta_sample_attr)
+
+colnames(openpbta_patient_attr)
+
+grep(
+  "OS|SURV|STATUS|AGE|DIAG|HIST|TUMOR|MEDULLO|GROUP|SUBTYPE",
+  colnames(openpbta_patient_attr),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+grep(
+  "OS|SURV|STATUS|AGE|DIAG|HIST|TUMOR|MEDULLO|GROUP|SUBTYPE",
+  colnames(openpbta_sample_attr),
+  value = TRUE,
+  ignore.case = TRUE
+)
+```
+
+```{r}
+#### OpenPBTA Medulloblastoma: Merge CD24 + Clinical (Age <= 21)
+
+openpbta_clinical <- openpbta_sample_attr %>%
+  left_join(
+    openpbta_patient_attr,
+    by = "PATIENT_ID"
+  )
+
+openpbta_medullo_cd24 <- openpbta_cd24_expr %>%
+  left_join(
+    openpbta_clinical,
+    by = c("sampleId" = "SAMPLE_ID")
+  ) %>%
+  mutate(
+    age_years = suppressWarnings(as.numeric(AGE)),
+    
+    os_months = suppressWarnings(as.numeric(OS_MONTHS)),
+    
+    os_event = case_when(
+      str_detect(str_to_upper(OS_STATUS), "DECEASED|DEAD|1:") ~ 1,
+      str_detect(str_to_upper(OS_STATUS), "LIVING|ALIVE|0:") ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    str_detect(
+      paste(
+        CANCER_TYPE,
+        CANCER_TYPE_DETAILED,
+        HISTOLOGY,
+        PATHOLOGY_FREE_TEXT_DIAGNOSIS
+      ),
+      regex("medulloblastoma", ignore_case = TRUE)
+    ),
+    
+    !is.na(age_years),
+    age_years <= 21,
+    
+    !is.na(CD24_expr),
+    !is.na(os_months),
+    !is.na(os_event)
+  )
+
+openpbta_medullo_cd24 %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(PATIENT_ID),
+    
+    deaths = sum(os_event == 1),
+    alive_censored = sum(os_event == 0),
+    
+    min_age = min(age_years, na.rm = TRUE),
+    median_age = median(age_years, na.rm = TRUE),
+    max_age = max(age_years, na.rm = TRUE),
+    
+    median_os_months = median(os_months, na.rm = TRUE),
+    median_CD24 = median(CD24_expr, na.rm = TRUE)
+  )
+
+table(openpbta_medullo_cd24$CANCER_TYPE)
+
+table(openpbta_medullo_cd24$CANCER_TYPE_DETAILED)
+
+table(openpbta_medullo_cd24$HISTOLOGY)
+
+table(openpbta_medullo_cd24$os_event)
+
+range(openpbta_medullo_cd24$age_years, na.rm = TRUE)
+```
+
+```{r}
+#### OpenPBTA Medulloblastoma: CD24 High vs Low
+
+openpbta_medullo_cd24 <- openpbta_medullo_cd24 %>%
+  mutate(
+    CD24_group = if_else(
+      CD24_expr >= median(CD24_expr, na.rm = TRUE),
+      "CD24 High tumors",
+      "CD24 Low tumors"
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+openpbta_medullo_cd24 %>%
+  dplyr::count(CD24_group)
+```
+
+```{r}
+ #### OpenPBTA Medulloblastoma: CD24 KM
+
+openpbta_medullo_cd24 <- openpbta_medullo_cd24 %>%
+  mutate(
+    CD24_group = case_when(
+      str_detect(as.character(CD24_group), "Low") ~ "CD24 Low tumors",
+      str_detect(as.character(CD24_group), "High") ~ "CD24 High tumors",
+      TRUE ~ as.character(CD24_group)
+    ),
+    CD24_group = factor(
+      CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+openpbta_medullo_fit <- survfit(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openpbta_medullo_cd24
+)
+
+openpbta_medullo_logrank <- survdiff(
+  Surv(os_months, os_event) ~ CD24_group,
+  data = openpbta_medullo_cd24
+)
+
+openpbta_medullo_logrank_p <- 1 - pchisq(
+  openpbta_medullo_logrank$chisq,
+  df = length(openpbta_medullo_logrank$n) - 1
+)
+
+openpbta_medullo_km <- ggsurvplot(
+  openpbta_medullo_fit,
+  data = openpbta_medullo_cd24,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.35,
+  pval = paste0("Log-rank p = ", signif(openpbta_medullo_logrank_p, 3)),
+  pval.coord = c(10, 0.10),
+  conf.int = FALSE,
+  palette = c("black", "#FF1493"),
+  legend.title = "",
+  legend.labs = c(
+    "CD24 Low tumors",
+    "CD24 High tumors"
+  ),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  ggtheme = theme_classic(base_size = 16),
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = FALSE,
+  risk.table.fontsize = 5,
+  tables.theme = theme_classic(base_size = 15)
+)
+
+openpbta_medullo_km$table <- openpbta_medullo_km$table +
+  scale_y_discrete(
+    labels = function(x) {
+      x %>%
+        str_remove("^CD24_group=")
+    }
+  ) +
+  labs(x = "Overall Survival (Months)") +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(
+      size = 14,
+      color = c("black", "#FF1493")
+    ),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 120)
+  )
+
+openpbta_medullo_km
+
+png(
+  "OpenPBTA_medulloblastoma_CD24_KM_age21under.png",
+  width = 2200,
+  height = 1600,
+  res = 200
+)
+
+print(openpbta_medullo_km)
+
+dev.off()
+
+pdf(
+  "OpenPBTA_medulloblastoma_CD24_KM_age21under.pdf",
+  width = 11,
+  height = 8
+)
+
+print(openpbta_medullo_km)
+
+dev.off()
+
+openpbta_medullo_logrank_p
+
+```
