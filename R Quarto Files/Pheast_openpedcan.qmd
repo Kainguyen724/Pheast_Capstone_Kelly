@@ -1,0 +1,662 @@
+---
+title: "Pheast_openpedcan"
+format: html
+editor: visual
+---
+
+## LOADING In dataset
+
+Dataset: openpedcan V15
+
+```{r}
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+
+base_url <- "https://cbioportal-api.ccdi.cancer.gov/api"
+study_id <- "openpedcan_v15"
+
+test_req <- request(paste0(base_url, "/studies/", study_id)) %>%
+  req_perform()
+
+resp_status(test_req)
+resp_content_type(test_req)
+
+body_text <- resp_body_string(test_req)
+substr(body_text, 1, 500)
+
+test_study <- test_req %>%
+  resp_body_json(simplifyVector = TRUE)
+
+test_study$name
+test_study$description
+```
+
+```{r}
+expr_profile_id <- "openpedcan_v15_rna_seq_v2_mrna"
+sample_list_id  <- "openpedcan_v15_rna_seq_v2_mrna"
+
+cd24_entrez <- 100133941
+```
+
+```{r}
+cd24_expr <- request(paste0(base_url, "/molecular-profiles/", expr_profile_id, "/molecular-data/fetch")) %>%
+  req_method("POST") %>%
+  req_body_json(list(
+    entrezGeneIds = list(cd24_entrez),
+    sampleListId = sample_list_id
+  )) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+cd24_expr_clean <- cd24_expr %>%
+  transmute(
+    sampleId = sampleId,
+    patientId = patientId,
+    CD24_expr = as.numeric(value)
+  ) %>%
+  filter(!is.na(CD24_expr))
+
+head(cd24_expr_clean)
+summary(cd24_expr_clean$CD24_expr)
+nrow(cd24_expr_clean)
+```
+
+```{r}
+openped_clinical_sample <- request(paste0(base_url, "/studies/", study_id, "/clinical-data")) %>%
+  req_url_query(
+    clinicalDataType = "SAMPLE",
+    projection = "DETAILED"
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+openped_clinical_patient <- request(paste0(base_url, "/studies/", study_id, "/clinical-data")) %>%
+  req_url_query(
+    clinicalDataType = "PATIENT",
+    projection = "DETAILED"
+  ) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+```
+
+```{r}
+openped_clinical_sample_wide <- openped_clinical_sample %>%
+  select(sampleId, patientId, clinicalAttributeId, value) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = clinicalAttributeId,
+    values_from = value,
+    values_fn = first
+  )
+
+openped_clinical_patient_wide <- openped_clinical_patient %>%
+  select(patientId, clinicalAttributeId, value) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = clinicalAttributeId,
+    values_from = value,
+    values_fn = first
+  )
+
+openped_clinical <- openped_clinical_sample_wide %>%
+  left_join(openped_clinical_patient_wide, by = "patientId")
+```
+
+```{r}
+names(openped_clinical)[str_detect(
+  names(openped_clinical),
+  regex("OS|SURV|DEATH|VITAL|STATUS|MONTH|DAYS", ignore_case = TRUE)
+)]
+```
+
+```{r}
+names(openped_clinical)[str_detect(
+  names(openped_clinical),
+  regex("CANCER|DIAG|TUMOR|ONCOTREE|HISTOLOGY|DISEASE", ignore_case = TRUE)
+)]
+```
+
+```{r}
+expr_profile_id <- "openpedcan_v15_rna_seq_v2_mrna"
+sample_list_id  <- "openpedcan_v15_rna_seq_v2_mrna"
+
+cd24_entrez <- 100133941
+
+cd24_expr <- request(paste0(base_url, "/molecular-profiles/", expr_profile_id, "/molecular-data/fetch")) %>%
+  req_method("POST") %>%
+  req_body_json(list(
+    entrezGeneIds = list(cd24_entrez),
+    sampleListId = sample_list_id
+  )) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+cd24_expr_clean <- cd24_expr %>%
+  transmute(
+    sampleId = sampleId,
+    patientId = patientId,
+    CD24_expr = as.numeric(value)
+  ) %>%
+  filter(!is.na(CD24_expr))
+```
+
+```{r}
+openped_cd24_surv <- cd24_expr_clean %>%
+  left_join(openped_clinical, by = c("sampleId", "patientId"))
+
+dim(openped_cd24_surv)
+head(openped_cd24_surv)
+```
+
+### Filtering:
+
+```{r}
+
+openped_cd24_surv_clean <- openped_cd24_surv %>%
+  mutate(
+    openped_cancer_type = CANCER_TYPE_DETAILED,
+    openped_os_months = as.numeric(OS_MONTHS),
+    openped_os_event = case_when(
+      str_detect(str_to_upper(OS_STATUS), "DECEASED|DEAD|1:") ~ 1,
+      str_detect(str_to_upper(OS_STATUS), "LIVING|ALIVE|0:") ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    !is.na(openped_cancer_type),
+    !is.na(CD24_expr),
+    !is.na(openped_os_months),
+    !is.na(openped_os_event)
+  )
+```
+
+```{r}
+openped_cd24_surv_clean %>%
+  summarise(
+    openped_n_samples = n(),
+    openped_n_patients = n_distinct(patientId),
+    openped_n_cancer_types = n_distinct(openped_cancer_type),
+    openped_deaths = sum(openped_os_event == 1),
+    openped_censored = sum(openped_os_event == 0)
+  )
+```
+
+#### Median CD24 cutoff within each cancer type:
+
+```{r}
+
+openped_cd24_surv_median <- openped_cd24_surv_clean %>%
+  group_by(openped_cancer_type) %>%
+  mutate(
+    openped_cancer_type_median_CD24 = median(CD24_expr, na.rm = TRUE),
+    openped_CD24_group = if_else(
+      CD24_expr >= openped_cancer_type_median_CD24,
+      "CD24 High",
+      "CD24 Low"
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    openped_CD24_group = factor(openped_CD24_group, levels = c("CD24 Low", "CD24 High"))
+  )
+```
+
+```{r}
+openped_cd24_surv_median %>%
+  count(openped_CD24_group)
+```
+
+```{r}
+openped_cd24_surv_median %>%
+  count(openped_cancer_type, openped_CD24_group) %>%
+  arrange(openped_cancer_type, openped_CD24_group)
+```
+
+### CD24 Kaplan-Meier:
+
+```{r}
+
+library(survival)
+
+openped_cd24_fit <- survfit(
+  Surv(openped_os_months, openped_os_event) ~ openped_CD24_group,
+  data = openped_cd24_surv_median
+)
+```
+
+```{r}
+plot(
+  openped_cd24_fit,
+  col = c("black", "#FF1493"),
+  lwd = 2,
+  xlab = "Overall Survival Time (Months)",
+  ylab = "Overall Survival Probability"
+)
+
+legend(
+  "bottomleft",
+  legend = levels(openped_cd24_surv_median$openped_CD24_group),
+  col = c("black", "#FF1493"),
+  lwd = 2,
+  bty = "n"
+)
+```
+
+```{r}
+openped_cd24_logrank <- survdiff(
+  Surv(openped_os_months, openped_os_event) ~ openped_CD24_group,
+  data = openped_cd24_surv_median
+)
+
+openped_cd24_pvalue <- 1 - pchisq(
+  openped_cd24_logrank$chisq,
+  length(openped_cd24_logrank$n) - 1
+)
+
+openped_cd24_pvalue
+```
+
+**Different package for better risk table:**
+
+```{r}
+library(tidyverse)
+library(survival)
+library(survminer)
+
+# ------------------------------------------------------------
+# Age filter first, then median CD24 split within cancer type
+# ------------------------------------------------------------
+
+openped_cd24_surv_median <- openped_cd24_surv_clean %>%
+  mutate(openped_age = suppressWarnings(as.numeric(AGE))) %>%
+  filter(!is.na(openped_age), openped_age < 18) %>%
+  group_by(openped_cancer_type) %>%
+  mutate(
+    openped_cancer_type_median_CD24 = median(CD24_expr, na.rm = TRUE),
+    openped_CD24_group = if_else(
+      CD24_expr >= openped_cancer_type_median_CD24,
+      "CD24 High tumors",
+      "CD24 Low tumors"
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    openped_CD24_group = factor(
+      openped_CD24_group,
+      levels = c("CD24 Low tumors", "CD24 High tumors")
+    )
+  )
+
+# Check counts after filtering
+openped_cd24_surv_median %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(patientId),
+    n_cancer_types = n_distinct(openped_cancer_type),
+    deaths = sum(openped_os_event == 1),
+    censored = sum(openped_os_event == 0)
+  )
+
+openped_cd24_surv_median %>%
+  count(openped_CD24_group)
+
+# ------------------------------------------------------------
+# Kaplan-Meier fit
+# ------------------------------------------------------------
+
+openped_cd24_fit <- survfit(
+  Surv(openped_os_months, openped_os_event) ~ openped_CD24_group,
+  data = openped_cd24_surv_median
+)
+
+# ------------------------------------------------------------
+# Log-rank test
+# ------------------------------------------------------------
+
+openped_cd24_logrank <- survdiff(
+  Surv(openped_os_months, openped_os_event) ~ openped_CD24_group,
+  data = openped_cd24_surv_median
+)
+
+openped_cd24_pvalue <- 1 - pchisq(
+  openped_cd24_logrank$chisq,
+  length(openped_cd24_logrank$n) - 1
+)
+
+# Print log-rank results to check
+openped_cd24_logrank
+openped_cd24_pvalue
+paste0("Log-rank p = ", signif(openped_cd24_pvalue, 3))
+
+# ------------------------------------------------------------
+# Kaplan-Meier plot with risk table
+# ------------------------------------------------------------
+
+openped_cd24_plot <- ggsurvplot(
+  openped_cd24_fit,
+  data = openped_cd24_surv_median,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.32,
+  break.time.by = 100,
+  xlim = c(0, 300),
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability",
+  legend.title = "",
+  legend.labs = c("CD24 Low tumors", "CD24 High tumors"),
+  legend = "top",
+  palette = c("black", "#FF1493"),
+  pval = paste0("Log-rank p = ", signif(openped_cd24_pvalue, 3)),
+  pval.coord = c(5, 0.06),
+  pval.size = 5,
+  conf.int = FALSE,
+  censor = TRUE,
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = TRUE,
+  fontsize = 5,
+  ggtheme = theme_classic(base_size = 18),
+  tables.theme = theme_cleantable(base_size = 16)
+)
+
+# Main plot formatting
+openped_cd24_plot$plot <- openped_cd24_plot$plot +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 18),
+    axis.title = element_text(size = 22),
+    axis.text = element_text(size = 16),
+    plot.margin = margin(t = 10, r = 20, b = 5, l = 20)
+  )
+
+# Risk table formatting
+# This avoids the axis.text.y merge error
+openped_cd24_plot$table <- openped_cd24_plot$table +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.text.x = element_text(size = 16),
+    plot.title = element_text(size = 20),
+    panel.grid = element_blank(),
+    plot.margin = margin(t = 5, r = 20, b = 10, l = 20)
+  )
+
+# ------------------------------------------------------------
+# Save to Desktop and show in Quarto
+# ------------------------------------------------------------
+
+png(
+  "~/Desktop/openped_CD24_Kaplan_Meier_OS_months_risk_table_poster_fixed_1.png",
+  width = 2500,
+  height = 2000,
+  res = 300
+)
+
+print(openped_cd24_plot)
+
+dev.off()
+
+knitr::include_graphics(
+  "~/Desktop/openped_CD24_Kaplan_Meier_OS_months_risk_table_poster_fixed_1.png"
+)
+```
+
+X-Axis As days not months :
+
+```{r}
+openped_cd24_surv_median <- openped_cd24_surv_median %>%
+  mutate(
+    openped_os_days = openped_os_months * 30.44
+  )
+
+openped_cd24_fit_days <- survfit(
+  Surv(openped_os_days, openped_os_event) ~ openped_CD24_group,
+  data = openped_cd24_surv_median
+)
+
+png(
+  "openped_CD24_Kaplan_Meier_OS_days_median_within_cancer_type.png",
+  width = 1600,
+  height = 1200,
+  res = 200
+)
+
+plot(
+  openped_cd24_fit_days,
+  col = c("black", "#FF1493"),
+  lwd = 2,
+  xlab = "Overall Survival (Days)",
+  ylab = "Overall Survival Probability"
+)
+
+legend(
+  "bottomleft",
+  legend = levels(openped_cd24_surv_median$openped_CD24_group),
+  col = c("black", "#FF1493"),
+  lwd = 2,
+  bty = "n"
+)
+
+text(
+  x = max(openped_cd24_surv_median$openped_os_days, na.rm = TRUE) * 0.75,
+  y = 0.9,
+  labels = paste0("Log-rank p = ", signif(openped_cd24_pvalue, 3))
+)
+
+dev.off()
+knitr::include_graphics("openped_CD24_Kaplan_Meier_OS_days_median_within_cancer_type.png")
+```
+
+### SIGLEC10
+
+```{r}
+openped_siglec10_entrez <- 89790
+```
+
+```{r}
+openped_siglec10_expr <- request(paste0(base_url, "/molecular-profiles/", expr_profile_id, "/molecular-data/fetch")) %>%
+  req_method("POST") %>%
+  req_body_json(list(
+    entrezGeneIds = list(openped_siglec10_entrez),
+    sampleListId = sample_list_id
+  )) %>%
+  req_perform() %>%
+  resp_body_json(simplifyVector = TRUE) %>%
+  as_tibble()
+
+openped_siglec10_expr_clean <- openped_siglec10_expr %>%
+  transmute(
+    sampleId = sampleId,
+    patientId = patientId,
+    SIGLEC10_expr = as.numeric(value)
+  ) %>%
+  filter(!is.na(SIGLEC10_expr))
+
+head(openped_siglec10_expr_clean)
+summary(openped_siglec10_expr_clean$SIGLEC10_expr)
+nrow(openped_siglec10_expr_clean)
+```
+
+```{r}
+openped_siglec10_surv <- openped_siglec10_expr_clean %>%
+  left_join(openped_clinical, by = c("sampleId", "patientId"))
+
+dim(openped_siglec10_surv)
+head(openped_siglec10_surv)
+```
+
+### Filter SIGLEC10 Data:
+
+```{r}
+openped_siglec10_surv_clean <- openped_siglec10_surv %>%
+  mutate(
+    openped_cancer_type = CANCER_TYPE_DETAILED,
+    openped_os_months = as.numeric(OS_MONTHS),
+    openped_os_event = case_when(
+      str_detect(str_to_upper(OS_STATUS), "DECEASED|DEAD|1:") ~ 1,
+      str_detect(str_to_upper(OS_STATUS), "LIVING|ALIVE|0:") ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    !is.na(openped_cancer_type),
+    !is.na(SIGLEC10_expr),
+    !is.na(openped_os_months),
+    !is.na(openped_os_event)
+  )
+```
+
+```{r}
+#checking # of samples that remain
+openped_siglec10_surv_clean %>%
+  summarise(
+    openped_n_samples = n(),
+    openped_n_patients = n_distinct(patientId),
+    openped_n_cancer_types = n_distinct(openped_cancer_type),
+    openped_deaths = sum(openped_os_event == 1),
+    openped_censored = sum(openped_os_event == 0)
+  )
+```
+
+#### Median SIGLEC10 cutoff within each cancer type:
+
+```{r}
+openped_siglec10_surv_median <- openped_siglec10_surv_clean %>%
+  group_by(openped_cancer_type) %>%
+  mutate(
+    openped_cancer_type_median_SIGLEC10 = median(SIGLEC10_expr, na.rm = TRUE),
+    openped_SIGLEC10_group = if_else(
+      SIGLEC10_expr >= openped_cancer_type_median_SIGLEC10,
+      "SIGLEC10 High",
+      "SIGLEC10 Low"
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    openped_SIGLEC10_group = factor(
+      openped_SIGLEC10_group,
+      levels = c("SIGLEC10 Low", "SIGLEC10 High")
+    )
+  )
+```
+
+```{r}
+openped_siglec10_surv_median %>%
+  count(openped_SIGLEC10_group)
+
+openped_siglec10_surv_median %>%
+  count(openped_cancer_type, openped_SIGLEC10_group) %>%
+  arrange(openped_cancer_type, openped_SIGLEC10_group)
+
+```
+
+### SIGLEC10 Kaplan-Meier:
+
+```{r}
+library(survival)
+
+openped_siglec10_fit <- survfit(
+  Surv(openped_os_months, openped_os_event) ~ openped_SIGLEC10_group,
+  data = openped_siglec10_surv_median
+)
+
+openped_siglec10_logrank <- survdiff(
+  Surv(openped_os_months, openped_os_event) ~ openped_SIGLEC10_group,
+  data = openped_siglec10_surv_median
+)
+
+openped_siglec10_pvalue <- 1 - pchisq(
+  openped_siglec10_logrank$chisq,
+  length(openped_siglec10_logrank$n) - 1
+)
+
+openped_siglec10_logrank
+openped_siglec10_pvalue
+```
+
+```{r}
+
+#months
+png(
+  "openped_SIGLEC10_Kaplan_Meier_OS_months_median_within_cancer_type.png",
+  width = 1600,
+  height = 1200,
+  res = 200
+)
+
+plot(
+  openped_siglec10_fit,
+  col = c("black", "#FF1493"),
+  lwd = 2,
+  xlab = "Overall Survival (Months)",
+  ylab = "Overall Survival Probability"
+)
+
+legend(
+  "bottomleft",
+  legend = levels(openped_siglec10_surv_median$openped_SIGLEC10_group),
+  col = c("black", "#FF1493"),
+  lwd = 2,
+  bty = "n"
+)
+
+text(
+  x = max(openped_siglec10_surv_median$openped_os_months, na.rm = TRUE) * 0.75,
+  y = 0.9,
+  labels = paste0("Log-rank p = ", signif(openped_siglec10_pvalue, 3))
+)
+
+dev.off()
+
+knitr::include_graphics("openped_SIGLEC10_Kaplan_Meier_OS_months_median_within_cancer_type.png")
+```
+
+```{r}
+# days 
+openped_siglec10_surv_median <- openped_siglec10_surv_median %>%
+  mutate(
+    openped_os_days = openped_os_months * 30.44
+  )
+
+openped_siglec10_fit_days <- survfit(
+  Surv(openped_os_days, openped_os_event) ~ openped_SIGLEC10_group,
+  data = openped_siglec10_surv_median
+)
+
+png(
+  "openped_SIGLEC10_Kaplan_Meier_OS_days_median_within_cancer_type.png",
+  width = 1600,
+  height = 1200,
+  res = 200
+)
+
+plot(
+  openped_siglec10_fit_days,
+  col = c("black", "#FF1493"),
+  lwd = 2,
+  xlab = "Overall Survival (Days)",
+  ylab = "Overall Survival Probability"
+)
+
+legend(
+  "bottomleft",
+  legend = levels(openped_siglec10_surv_median$openped_SIGLEC10_group),
+  col = c("black", "#FF1493"),
+  lwd = 2,
+  bty = "n"
+)
+
+text(
+  x = max(openped_siglec10_surv_median$openped_os_days, na.rm = TRUE) * 0.75,
+  y = 0.9,
+  labels = paste0("Log-rank p = ", signif(openped_siglec10_pvalue, 3))
+)
+
+dev.off()
+
+knitr::include_graphics("openped_SIGLEC10_Kaplan_Meier_OS_days_median_within_cancer_type.png")
+```
